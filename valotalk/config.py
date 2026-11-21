@@ -40,6 +40,18 @@ DEFAULTS: dict = {
             "max_utterance_ms": 8000,
             "preroll_ms": 240,
             "silero_window_s": 8.0,    # 与 max_utterance 对齐，别互相截断
+
+            # ---- 静音判定自适应 ----
+            # 固定 380ms 的问题是「安静时白等、枪战时不够」。开这个以后
+            # 按背景噪声自动调等待时长：安静省约 280ms，枪战多等一点换准确。
+            "adaptive_gap": True,
+            "gap_min_ms": 200,         # 安静时等多久就切段
+            "gap_max_ms": 420,         # 枪战时等多久（别超过原来固定的 380 太多）
+            "noise_quiet_rms": 0.005,  # 低于这个视为安静
+            "noise_loud_rms": 0.055,   # 高于这个视为枪战
+            "noise_smooth": 0.15,      # 噪声估计 EMA 系数（越小越稳、越迟钝）
+            "gap_max_step_ms": 60,     # 等待时长单次最多变多少，防抖动
+            "check_fast_ms": 120,      # 检测到语音快说完时的加急轮询间隔
         },
     },
     "translate": {
@@ -62,7 +74,11 @@ DEFAULTS: dict = {
     "ocr": {
         "engine": "auto",              # auto / rapidocr / winrt
         "region": [0, 0, 0, 0],        # [x1,y1,x2,y2]，全 0 表示未设置
-        "interval_ms": 2000,           # 聊天扫描间隔；抓屏会读回显存，别太勤
+        "interval_ms": 2500,           # 聊天扫描间隔；抓屏会读回显存，别太勤
+        "idle_backoff_max": 4.0,       # 连续没新消息时间隔最多拉长到几倍
+        # OCR 线程数：1=省 CPU(829ms) 2=平衡(650ms) 4=最快(625ms)
+        # 墙钟越短聊天译文出得越快，但 CPU 总量成倍涨（打游戏会掉帧）
+        "onnx_threads": 2,
         "min_confidence": 0.50,
         "max_lines": 10,
         "translate": True,
@@ -85,11 +101,11 @@ DEFAULTS: dict = {
         "toggle_mute_outgoing": "f5",
     },
     "remote": {
-        "enabled": True,               # 手机遥控（局域网 HTTP）：游戏独占键鼠时的唯一出路
+        "enabled": False,              # 手机遥控（局域网 HTTP），默认关，面板上可开
         "port": 8765,
         "token": "",                   # 访问口令，二维码/复制都带着它
         "auto_token": True,            # token 为空时自动生成（公用 WiFi 下强烈建议）
-        "start_with_app": True,        # 程序启动时自动开
+        "start_with_app": True,        # 程序启动时自动开（仅在 enabled 为真时）
     },
     "overlay": {
         "font_family": "Microsoft YaHei UI",
@@ -112,6 +128,11 @@ DEFAULTS: dict = {
     },
     "ui": {
         "panel_on_top": True,
+    },
+    "update": {
+        "enabled": True,               # 软件内自动更新
+        "check_on_start": True,        # 每次启动检查一次
+        "skipped_version": "",         # 「下次再说」记住的版本，不重复打扰
     },
 }
 

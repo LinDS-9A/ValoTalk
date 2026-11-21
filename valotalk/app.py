@@ -13,16 +13,18 @@ import os
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
 import queue
+import subprocess
 import threading
 import time
 import tkinter as tk
 from dataclasses import dataclass, field
+from pathlib import Path
 from tkinter import ttk
 
 import numpy as np
 
 from . import __version__
-from . import capture, remote, ui_theme as ui, winapi
+from . import capture, remote, ui_theme as ui, updater, winapi
 from .asr import WhisperASR
 from .config import CONFIG
 from .ocr import ChatOCR, LineDiffer, is_player_chat
@@ -196,12 +198,21 @@ class App:
         self.overlay = Overlay(self.root, self._get, self._set)
         if not self._get("overlay.click_through", True):
             self.overlay.bind_drag()
+        # 拖动结束后刷新面板上的坐标
+        self.overlay.on_moved = lambda _x, _y: self._refresh_pos_label()
+        # overlay 建好之后才能读到实际坐标
+        self._refresh_pos_label()
+
+        # 自动更新：启动后隔 4s 查（别和模型加载抢带宽）
+        self.updater = updater.Updater(self._get, log=self.log)
+        self._update_dialog = None
 
         self.root.after(40, self._pump_ui)
         self.root.after(150, self._start_remote)
         # 等游戏进程可查再判权限（游戏没开时 keyinject_blocked 返回 False）
         self.root.after(1800, self._check_permission)
         self.root.after(300, self._autostart)
+        self.root.after(4000, self._check_update_async)
         self.root.protocol("WM_DELETE_WINDOW", self.shutdown)
 
     # ============================================================ UI
@@ -224,11 +235,22 @@ class App:
 
         tk.Label(head, text="ValoTalk", bg=ui.BG, fg=ui.TEXT,
                  font=(ui.FONT, 18, "bold")).pack(side="left")
-        tk.Label(head, text=f"v{__version__}", bg=ui.BG, fg=ui.TEXT3,
-                 font=(ui.FONT, 9)).pack(side="left", padx=(6, 0), pady=(7, 0))
+        self.ver_lbl = tk.Label(head, text=f"v{__version__}", bg=ui.BG, fg=ui.TEXT3,
+                                font=(ui.FONT, 9), cursor="hand2")
+        self.ver_lbl.pack(side="left", padx=(6, 0), pady=(7, 0))
+        self.ver_lbl.bind("<Button-1>", lambda _e: self._manual_check_update())
+        self.ver_lbl.bind("<Enter>", lambda _e: self.ver_lbl.configure(fg=ui.BLUE))
+        self.ver_lbl.bind("<Leave>", lambda _e: self.ver_lbl.configure(fg=ui.TEXT3))
+
+        # 手动检查更新（和启动时自动检查互不干扰）
+        self.btn_update = ui.RoundButton(
+            head, "检查更新", command=self._manual_check_update,
+            width=76, height=24, fill=ui.CARD2, bg=ui.BG, font_size=ui.FS_SMALL)
+        self.btn_update.pack(side="left", padx=(8, 0), pady=(3, 0))
+
         self.state_lbl = tk.Label(head, text="● 未启动", bg=ui.BG, fg=ui.RED,
                                   font=(ui.FONT, 10, "bold"))
-        self.state_lbl.pack(side="left", padx=(14, 0))
+        self.state_lbl.pack(side="left", padx=(12, 0))
         self.meter_lbl = tk.Label(head, text="", bg=ui.BG, fg=ui.TEXT2,
                                   font=(ui.FONT, 9))
         self.meter_lbl.pack(side="left", padx=(8, 0))
@@ -352,6 +374,7 @@ class App:
         self.v_orig = tk.BooleanVar(value=bool(self._get("overlay.show_original", True)))
         self.v_through = tk.BooleanVar(value=bool(self._get("overlay.click_through", True)))
         self.v_cpu = tk.BooleanVar(value=str(self._get("asr.device", "auto")) == "cpu")
+        self.v_remote = tk.BooleanVar(value=bool(self._get("remote.enabled", False)))
 
         for text, var, cb in [
             ("队友语音 → 中文字幕", self.v_team,
@@ -364,11 +387,27 @@ class App:
              lambda: self._set("overlay.show_original", self.v_orig.get())),
             ("字幕穿透鼠标", self.v_through, self._on_through_toggle),
             ("识别用 CPU（不抢显卡）", self.v_cpu, self._on_cpu_toggle),
+            ("手机遥控", self.v_remote, self._on_remote_toggle),
         ]:
             tr = ui.ToggleRow(b2, text, var, command=cb)
             tr.pack(fill="x", pady=1)
             if var is self.v_me:
                 self.chk_me = tr
+            elif var is self.v_remote:
+                self.chk_remote = tr
+
+        # 手机遥控的地址 + 二维码，塞在同一行的文字和开关之间
+        self.remote_lbl = tk.Label(self.chk_remote.extra, text="未开启",
+                                   bg=ui.CARD, fg=ui.TEXT3,
+                                   font=(ui.FONT, 8), anchor="w")
+        self.remote_lbl.pack(side="left")
+        self.btn_remote_qr = ui.RoundButton(
+            self.chk_remote.extra, "二维码", command=self._show_remote_qr,
+            width=58, height=22, font_size=8)
+        # 关着的时候先不显示，开了才出现（见 _set_remote_ui）
+        if self._get("remote.enabled", False):
+            self.btn_remote_qr.pack(side="left", padx=(6, 0))
+        self.chk_remote.pack_extra()
 
         # ===== 右列：快捷键 =====
         card3 = ui.RoundCard(right, pad=14)
@@ -401,19 +440,37 @@ class App:
         ui.RoundButton(sub, "检测按键", command=self._key_probe,
                        width=84, height=28).pack(side="left")
         ui.RoundButton(sub, "字幕贴回下方",
-                       command=lambda: self.overlay.reset_position(),
+                       command=self._reset_subtitle_pos,
                        width=112, height=28).pack(side="left", padx=(6, 0))
 
-        # 手机遥控：游戏独占键鼠时热键进不去，手机点一下才是可靠的办法
-        rm_row = tk.Frame(b3, bg=ui.CARD)
-        rm_row.pack(fill="x", pady=(8, 0))
-        tk.Label(rm_row, text="手机", bg=ui.CARD, fg=ui.TEXT2,
+        # ===== 字幕大小 & 位置 =====
+        cfg_row = tk.Frame(b3, bg=ui.CARD)
+        cfg_row.pack(fill="x", pady=(8, 0))
+        tk.Label(cfg_row, text="字幕", bg=ui.CARD, fg=ui.TEXT2,
                  font=(ui.FONT, ui.FS_SMALL), width=5, anchor="w").pack(side="left")
-        self.remote_lbl = tk.Label(rm_row, text="启动中…", bg=ui.CARD, fg=ui.TEXT3,
-                                   font=(ui.FONT, ui.FS_SMALL), anchor="w")
-        self.remote_lbl.pack(side="left")
-        ui.RoundButton(rm_row, "二维码", command=self._show_remote_qr,
-                       width=58, height=26).pack(side="right")
+
+        # 字号：A- 19 A+
+        ui.RoundButton(cfg_row, "A−", command=lambda: self._adj_font(-1),
+                       width=32, height=26).pack(side="left")
+        self.font_lbl = tk.Label(cfg_row, text=str(self._get("overlay.font_size", 19)),
+                                 bg=ui.CARD, fg=ui.TEXT,
+                                 font=(ui.FONT, ui.FS_SMALL, "bold"), width=3)
+        self.font_lbl.pack(side="left", padx=(2, 2))
+        ui.RoundButton(cfg_row, "A+", command=lambda: self._adj_font(1),
+                       width=32, height=26).pack(side="left")
+
+        # 位置：上下左右微调
+        tk.Frame(cfg_row, bg=ui.CARD, width=10).pack(side="left")
+        for txt, fn, w in (("↑", lambda: self._nudge("up"), 28),
+                           ("↓", lambda: self._nudge("down"), 28),
+                           ("←", lambda: self._nudge("left"), 28),
+                           ("→", lambda: self._nudge("right"), 28)):
+            ui.RoundButton(cfg_row, txt, command=fn,
+                           width=w, height=26).pack(side="left", padx=(0, 2))
+
+        self.pos_lbl = tk.Label(cfg_row, text="", bg=ui.CARD, fg=ui.TEXT3,
+                                font=(ui.FONT, 8))
+        self.pos_lbl.pack(side="left", padx=(4, 0))
 
         # ===== 右列：聊天区域 & 翻译 =====
         card4 = ui.RoundCard(right, pad=14)
@@ -431,6 +488,35 @@ class App:
         self.region_lbl.pack(side="left", padx=(0, 8))
         ui.RoundButton(reg, "框选", command=self._pick_region,
                        width=56, height=28).pack(side="left")
+
+        # OCR 速度档位：墙钟越短翻译越快，但 CPU 成倍涨
+        spd_row = tk.Frame(b4, bg=ui.CARD)
+        spd_row.pack(fill="x", pady=(8, 0))
+        tk.Label(spd_row, text="OCR 速度", bg=ui.CARD, fg=ui.TEXT2,
+                 font=(ui.FONT, ui.FS_SMALL), width=9, anchor="w").pack(side="left")
+        self.ocr_speed = ChatOCR.SPEED_CHOICES          # {1: "...", 2: "...", 4: "..."}
+        labels = [self.ocr_speed[k] for k in sorted(self.ocr_speed)]
+        sc = ui.RoundCombo(spd_row, labels, width=132, height=28)
+        cur_threads = int(self._get("ocr.onnx_threads",
+                                    ChatOCR.DEFAULT_THREADS)
+                          or ChatOCR.DEFAULT_THREADS)
+        sc.set(self.ocr_speed.get(cur_threads,
+                                  self.ocr_speed[ChatOCR.DEFAULT_THREADS]))
+        sc.pack(side="left")
+        sc.bind_select(self._on_ocr_speed_change)
+        self.cb_ocr_speed = sc
+
+        import os as _os
+        cores = _os.cpu_count() or 4
+        safe = ChatOCR.threads_safe_limit()
+        hint = "墙钟越短越快，CPU 占用越高"
+        if cores < 8:
+            hint += f"（{cores} 核，建议≤「{self.ocr_speed[safe]}」）"
+        self.spd_hint = tk.Label(
+            b4, text=hint,
+            bg=ui.CARD, fg=ui.TEXT3, font=(ui.FONT, 8),
+            anchor="w", justify="left")
+        self.spd_hint.pack(fill="x", pady=(3, 0))
 
         tr_row = tk.Frame(b4, bg=ui.CARD)
         tr_row.pack(fill="x", pady=(8, 0))
@@ -846,6 +932,103 @@ class App:
     def _remote_clear(self) -> None:
         self._ui_call(self.overlay, "clear")
 
+    def _on_ocr_speed_change(self) -> None:
+        """切换 OCR 线程档位。要重建引擎，下次识别会慢一下。"""
+        label = self.cb_ocr_speed.get()
+        threads = ChatOCR.DEFAULT_THREADS
+        for n, text in ChatOCR.SPEED_CHOICES.items():
+            if text == label:
+                threads = n
+                break
+        old = int(self._get("ocr.onnx_threads", ChatOCR.DEFAULT_THREADS)
+                  or ChatOCR.DEFAULT_THREADS)
+        if threads == old:
+            return
+        self._set("ocr.onnx_threads", threads)
+        self.ocr.set_threads(threads)
+
+        import os
+        cores = os.cpu_count() or 4
+        note = {1: "省 CPU，但每次识别慢一些",
+                2: "CPU 和速度折中",
+                4: "识别最快，但 CPU 总量涨到 1 线程的 4.8 倍"}.get(threads, "")
+        self.log(f"[OCR] 线程 {old} → {threads}（{label}）：{note}")
+
+        # 核心数不够时提醒 —— 实测 6 核开 4 线程会明显掉帧
+        safe = ChatOCR.threads_safe_limit()
+        if threads > safe:
+            self.log(f"[OCR] ⚠ 你的 CPU 是 {cores} 核，{threads} 线程可能让游戏掉帧"
+                     f"（实测 6 核会丢 7 帧）；建议用「{ChatOCR.SPEED_CHOICES[safe]}」")
+        self.log("[OCR] 引擎重建中，下一句聊天识别会稍慢")
+
+    # ============================================================ 手机遥控
+    def _on_remote_toggle(self) -> None:
+        """功能开关区的「手机遥控当说话键」被切换。"""
+        on = bool(self.v_remote.get())
+        self._set("remote.enabled", on)
+        if on:
+            self._set_remote_ui(None)          # 启动中
+            threading.Thread(target=self._start_remote, daemon=True).start()
+            self.log("[手机] 正在开启遥控 …")
+        else:
+            self.remote.stop()
+            self._set_remote_ui(False)
+            self.log("[手机] 遥控已关闭（端口已释放）")
+
+    def _set_remote_ui(self, on: bool | None) -> None:
+        """地址行：True=已开 / False=已关 / None=启动中。
+
+        关着时把二维码按钮藏起来，省出位置给地址文字。
+        """
+        def apply():
+            try:
+                if on is True:
+                    self.remote_lbl.configure(fg=ui.BLUE)
+                    if not self.btn_remote_qr.winfo_manager():
+                        self.btn_remote_qr.pack(side="left", padx=(6, 0))
+                else:
+                    self.remote_lbl.configure(
+                        text="启动中…" if on is None else "未开启",
+                        fg=ui.TEXT3)
+                    if self.btn_remote_qr.winfo_manager():
+                        self.btn_remote_qr.pack_forget()
+            except Exception:
+                pass
+        self._uiq.put(apply)
+
+    # ============================================================ 字幕大小/位置
+    def _adj_font(self, delta: int) -> None:
+        cur = self.overlay.font_size()
+        new = self.overlay.set_font_size(cur + delta)
+        try:
+            self.font_lbl.configure(text=str(new))
+        except Exception:
+            pass
+        if new == cur:
+            self.log(f"[字幕] 字号已是{'最小' if delta < 0 else '最大'} {new}")
+            return
+        self.overlay.preview()
+        self.log(f"[字幕] 字号 {cur} → {new}")
+
+    def _nudge(self, direction: str) -> None:
+        step = 20
+        fn = {"up": self.overlay.nudge_up, "down": self.overlay.nudge_down,
+              "left": self.overlay.nudge_left, "right": self.overlay.nudge_right}
+        fn.get(direction, self.overlay.nudge_down)(step)
+        self._refresh_pos_label()
+        self.overlay.preview()
+
+    def _reset_subtitle_pos(self) -> None:
+        self.overlay.reset_position()
+        self._refresh_pos_label()
+        self.log("[字幕] 已贴回屏幕下方居中")
+
+    def _refresh_pos_label(self) -> None:
+        try:
+            self.pos_lbl.configure(text=f"{self.overlay.x},{self.overlay.y}")
+        except Exception:
+            pass
+
     def _ensure_remote_token(self) -> str:
         """没设口令就自动生成一个并写回 config。
 
@@ -869,17 +1052,23 @@ class App:
             def apply():
                 try:
                     self.remote_lbl.configure(text=text, foreground=color)
+                    if color == ui.BLUE and not self.btn_remote_qr.winfo_manager():
+                        self.btn_remote_qr.pack(side="left", padx=(6, 0))
+                    elif color != ui.BLUE and self.btn_remote_qr.winfo_manager():
+                        self.btn_remote_qr.pack_forget()
                 except Exception:
                     pass
             self._uiq.put(apply)
 
-        if not self._get("remote.enabled", True):
-            label("已关闭", ui.TEXT3)
+        if not self._get("remote.enabled", False):
+            self.v_remote.set(False)
+            self._set_remote_ui(False)
             return
         self.remote.token = self._ensure_remote_token()
         url = self.remote.start()
         if url:
-            # 标签只显示 ip:port，口令藏在二维码/复制里 —— 全写出来会挤掉按钮
+            self._set_remote_ui(True)
+            # 只显示 ip:port，口令藏在二维码/复制里 —— 全写出来会挤掉按钮
             label(f"{self.remote.ip}:{self.remote.port}", ui.BLUE)
             self.log(f"[手机] 遥控已开启：{self.remote.ip}:{self.remote.port}"
                      f"（点「二维码」扫码，或「复制」拿带口令的完整地址）")
@@ -890,6 +1079,8 @@ class App:
             self.log("       手机连同一个 WiFi，扫码打开，按住或点一下大圆按钮说话")
             threading.Thread(target=self._check_firewall, daemon=True).start()
         else:
+            self.v_remote.set(False)
+            self._set("remote.enabled", False)
             label("启动失败", ui.RED)
             self.log(f"[手机] 遥控启动失败：{self.remote.error}")
             self.log("       Windows 防火墙可能挡住了，点「二维码」→「放行防火墙」")
@@ -1201,9 +1392,21 @@ class App:
         self._chat_thread.start()
 
     def _chat_loop(self) -> None:
+        """聊天框 OCR 轮询。
+
+        空闲退避：聊天框长时间没新内容时把间隔按倍数拉长（最多 4 倍），
+        一旦出现新行立刻回到正常节奏。OCR 一次要 930ms CPU（1 线程），
+        按 2s 间隔算就是 46% 单核 —— 静止时没必要这么勤。
+        """
         miss = 0
+        idle = 0                      # 连续几次没有新内容
         while not self._chat_stop.is_set():
-            interval = max(400, int(self._get("ocr.interval_ms", 1200) or 1200))
+            base = max(400, int(self._get("ocr.interval_ms", 2500) or 2500))
+            backoff_max = float(self._get("ocr.idle_backoff_max", 4.0) or 4.0)
+            # 连续 3 次无新行就开始退避：×2、×3、×4（封顶）
+            step = 0 if idle < 3 else min(int(backoff_max), 1 + (idle - 2))
+            interval = base * max(1, step)
+
             region = self._get("ocr.region", [0, 0, 0, 0])
             if not self.flags["chat"] or not region or region[2] <= region[0]:
                 time.sleep(0.4)
@@ -1220,6 +1423,10 @@ class App:
             fresh = self.differ.push(lines)
             # 只翻玩家说的话；系统广播（下包/回合/上线提示）整行无视
             fresh = [ln for ln in fresh if is_player_chat(ln)]
+            if fresh:
+                idle = 0                      # 有新消息，回到正常节奏
+            else:
+                idle += 1
             for ln in fresh[:4]:
                 try:
                     self.post_q.put_nowait(Job(kind="chat", text=ln))
@@ -1314,6 +1521,110 @@ class App:
             self.shutdown()
         else:
             self.log("提权被取消。可以手动：右键 run.bat → 以管理员身份运行")
+
+    # ============================================================ 自动更新
+    def _check_update_async(self) -> None:
+        if not self._get("update.check_on_start", True):
+            return
+        threading.Thread(target=self._check_update, name="update-check",
+                         daemon=True).start()
+
+    def _check_update(self) -> None:
+        """启动时的自动检查：只在有新版本时弹窗，其它情况静默。"""
+        try:
+            info = self.updater.check()
+        except Exception as exc:
+            self.log(f"[更新] 检查失败：{exc}")
+            return
+        if info is None:
+            if self.updater.last_error:
+                self.log(f"[更新] {self.updater.last_error}")
+            return
+        # 「下次再说」记住过的版本不再打扰，直到出现更新的版本
+        skipped = str(self._get("update.skipped_version", "") or "")
+        if skipped and updater.parse_version(skipped) >= updater.parse_version(info.version):
+            return
+        self.log(f"[更新] 发现新版本 v{info.version}（当前 v{__version__}）")
+        self.root.after(0, lambda: self._show_update_dialog(info))
+
+    def _show_update_dialog(self, info) -> None:
+        from .update_ui import UpdateDialog
+        if self._update_dialog is not None:
+            try:
+                if self._update_dialog.top.winfo_exists():
+                    return
+            except Exception:
+                pass
+        self._update_dialog = UpdateDialog(
+            self.root, info, self.updater,
+            on_applied=self._restart_for_update,
+            log=self.log,
+            on_later=lambda: self._set("update.skipped_version", info.version),
+        )
+
+    def _restart_for_update(self) -> None:
+        """更新完成后重启：优先用 run.bat（它会自己处理提权）。"""
+        run_bat = Path(__file__).resolve().parent.parent / "run.bat"
+        self.log("[更新] 正在重启 …")
+        try:
+            if run_bat.exists():
+                subprocess.Popen(["cmd", "/c", str(run_bat)],
+                                 cwd=str(run_bat.parent),
+                                 creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+            else:
+                winapi.relaunch_as_admin()
+        except Exception as exc:
+            self.log(f"[更新] 重启失败：{exc}，请手动重开")
+            return
+        self.shutdown()
+
+    def _manual_check_update(self) -> None:
+        """手动检查更新：忽略 skipped_version，结果一定告诉用户。
+
+        和启动时的自动检查不冲突 —— 自动检查只在有新版本时弹窗，
+        静默失败；手动检查一定会给反馈（已是最新 / 发现新版 / 失败）。
+        """
+        if getattr(self, "_upd_checking", False):
+            return
+        self._upd_checking = True
+        self._ui_call(self.btn_update, "set_enabled", False)
+        self._ui_call(self.btn_update, "set_text", "检查中…")
+        self.log("[更新] 手动检查 …")
+        # 手动检查视为「我主动想知道」，清掉之前压下的忽略项
+        self._set("update.skipped_version", "")
+
+        def run():
+            try:
+                info = self.updater.check()
+                err = self.updater.last_error
+            except Exception as exc:
+                info, err = None, f"{type(exc).__name__}: {exc}"
+            self._uiq.put(lambda: self._manual_check_done(info, err))
+
+        threading.Thread(target=run, name="update-manual", daemon=True).start()
+
+    def _manual_check_done(self, info, err: str) -> None:
+        self._upd_checking = False
+        self._ui_call(self.btn_update, "set_enabled", True)
+        self._ui_call(self.btn_update, "set_text", "检查更新")
+
+        if info is not None:
+            self.log(f"[更新] 发现新版本 v{info.version}")
+            self._show_update_dialog(info)
+            return
+        if err:
+            self.log(f"[更新] 检查失败：{err}")
+            from .update_ui import NoticeDialog
+            NoticeDialog(
+                self.root, "检查更新失败",
+                f"{err}\n\n可能是网络问题，稍后再试。也可以到 GitHub Releases "
+                f"页面手动下载最新版。", kind="fail")
+            return
+        self.log(f"[更新] 当前 v{__version__} 已是最新版本")
+        from .update_ui import NoticeDialog
+        NoticeDialog(
+            self.root, "已是最新版本",
+            f"当前版本 v{__version__}，没有可用的更新。", kind="ok")
 
     def _overlay(self, tag: str, text: str, original: str = "") -> None:
         self._ui_call(self.overlay, "add", tag, text, original)

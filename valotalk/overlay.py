@@ -33,6 +33,7 @@ class Overlay:
         self.items: list[Item] = []
         self._click_through = bool(cfg_get("overlay.click_through", True))
         self._hwnd = 0
+        self.on_moved = None        # 拖动结束后的回调（面板刷新坐标用）
 
         self.win = tk.Toplevel(root)
         self.win.overrideredirect(True)
@@ -83,6 +84,67 @@ class Overlay:
         self._apply_geometry()
         winapi.keep_topmost(self._hwnd)
         self._render()
+
+    # ---------------- 字号 / 位置（面板可调） ----------------
+    FONT_MIN = 12
+    FONT_MAX = 48
+
+    def font_size(self) -> int:
+        try:
+            return int(self._get("overlay.font_size", 19) or 19)
+        except (TypeError, ValueError):
+            return 19
+
+    def set_font_size(self, size: int, save: bool = True) -> int:
+        """改字号并立刻重绘。返回实际生效的字号（已钳到 12~48）。"""
+        size = max(self.FONT_MIN, min(self.FONT_MAX, int(size)))
+        self._set("overlay.font_size", size, save=save)
+        self._render()
+        return size
+
+    def move_by(self, dx: int = 0, dy: int = 0, save: bool = True) -> tuple[int, int]:
+        """按像素微调位置。返回新 (x, y)。"""
+        sw = self.win.winfo_screenwidth()
+        sh = self.win.winfo_screenheight()
+        # 别让字幕整个跑出屏幕：左右至少留 120px 可见，上下留 60px
+        nx = max(-self.width + 120, min(sw - 120, self.x + int(dx)))
+        ny = max(-60, min(sh - 60, self.y + int(dy)))
+        self.win.geometry(f"+{nx}+{ny}")
+        self.x, self.y = nx, ny
+        self._set("overlay.x", nx, save=False)
+        self._set("overlay.y", ny, save=save)
+        self._render()
+        return nx, ny
+
+    def nudge_up(self, step: int = 20) -> None:
+        self.move_by(0, -step)
+
+    def nudge_down(self, step: int = 20) -> None:
+        self.move_by(0, +step)
+
+    def nudge_left(self, step: int = 20) -> None:
+        self.move_by(-step, 0)
+
+    def nudge_right(self, step: int = 20) -> None:
+        self.move_by(+step, 0)
+
+    def preview(self, text: str = "", ttl: float = 2.5) -> None:
+        """调字号/位置时给一条临时字幕，让用户立刻看见效果。"""
+        if not text:
+            text = f"字幕预览 · 字号 {self.font_size()}"
+        self.items.append(Item("系统", text, "", time.time(), ttl))
+        self._render()
+        winapi.keep_topmost(self._hwnd)
+
+    def save_position(self) -> None:
+        """把当前位置写盘（拖动结束后调用）。"""
+        self._set("overlay.x", self.x, save=False)
+        self._set("overlay.y", self.y, save=True)
+        if callable(self.on_moved):
+            try:
+                self.on_moved(self.x, self.y)
+            except Exception:
+                pass
 
     # ---------------- 点击穿透 ----------------
     def set_click_through(self, enabled: bool) -> None:
@@ -221,8 +283,7 @@ class Overlay:
             self.x, self.y = nx, ny
 
         def end(_e):
-            self._set("overlay.x", self.x, save=False)
-            self._set("overlay.y", self.y, save=True)
+            self.save_position()
 
         for w in (self.canvas, self.win):
             w.bind("<ButtonPress-1>", start)

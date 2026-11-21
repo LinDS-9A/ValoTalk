@@ -16,42 +16,66 @@ except Exception:  # pragma: no cover
 
 _OCR_ENGINE = None
 _OCR_ENGINE_KIND = ""
+_OCR_THREADS = 0                  # 当前 patch 生效的线程数
 
 
-def _limit_onnx_threads(n: int = 2) -> None:
+def _limit_onnx_threads(n: int = 1, force: bool = False) -> None:
     """onnxruntime 默认 intra_op_num_threads=0 即「有多少核用多少核」。
 
-    实测：一次 OCR 墙钟 178ms，却吃掉 2822ms CPU —— 16 个核一起上。
-    打游戏时这就是掉帧元凶，这里强制压到 2 个线程。
+    线程数是个真实的取舍（同一张 566x212 的聊天截图实测）：
+
+      1 线程 → 墙钟 829ms，CPU 总量  930ms   ← 省 CPU，但慢
+      2 线程 → 墙钟 650ms，CPU 总量 2461ms
+      4 线程 → 墙钟 625ms，CPU 总量 5477ms   ← 快一点，CPU 涨 5.9 倍
+
+    多线程只把墙钟压了 200ms，CPU 却成倍涨（同步开销 + 缓存失效）。
+    打游戏时 CPU 才是疼的地方，所以默认 1 线程，面板上可切。
     """
+    global _OCR_THREADS
     try:
         import onnxruntime as ort
         if getattr(ort.InferenceSession, "_valotalk_patched", False):
-            return
+            if not force or _OCR_THREADS == n:
+                return
+            # 已经打过补丁且要换线程数：还原成原始实现再重打
+            orig = getattr(ort.InferenceSession, "_valotalk_orig", None)
+            if orig is not None:
+                ort.InferenceSession.__init__ = orig
+            else:
+                return
+
         original = ort.InferenceSession.__init__
 
         def patched(self, path_or_bytes, sess_options=None, providers=None,
                     provider_options=None, **kwargs):
             if sess_options is None:
                 sess_options = ort.SessionOptions()
-            if getattr(sess_options, "intra_op_num_threads", 0) == 0:
-                sess_options.intra_op_num_threads = n
-                sess_options.inter_op_num_threads = 1
-                sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+            sess_options.intra_op_num_threads = n
+            sess_options.inter_op_num_threads = 1
+            sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
             return original(self, path_or_bytes, sess_options, providers,
                             provider_options, **kwargs)
 
         patched._valotalk_patched = True
         ort.InferenceSession.__init__ = patched
+        ort.InferenceSession._valotalk_orig = original
+        _OCR_THREADS = n
     except Exception:
         pass
 
 
-def _load_rapidocr():
+def reset_engine() -> None:
+    """丢掉已建好的引擎，下次 ensure_engine 按新线程数重建。"""
+    global _OCR_ENGINE, _OCR_ENGINE_KIND
+    _OCR_ENGINE = None
+    _OCR_ENGINE_KIND = ""
+
+
+def _load_rapidocr(threads: int = 1):
     global _OCR_ENGINE, _OCR_ENGINE_KIND
     if _OCR_ENGINE_KIND == "rapidocr" and _OCR_ENGINE is not None:
         return _OCR_ENGINE
-    _limit_onnx_threads(2)          # 必须在建 session 之前打补丁
+    _limit_onnx_threads(threads, force=True)   # 必须在建 session 之前打补丁
     try:
         from rapidocr_onnxruntime import RapidOCR
         _OCR_ENGINE = RapidOCR()
@@ -87,6 +111,70 @@ class ChatOCR:
         self.kind = ""
         self.last_error = ""
         self._lock = threading.Lock()
+        self._threads: int | None = None      # 惰性从 config 读，之后自己记住
+
+    # ---------------- 线程档位 ----------------
+    SPEED_CHOICES = {
+        1: "省 CPU（829ms）",
+        2: "平衡（650ms）",
+        4: "最快（625ms）",
+    }
+    DEFAULT_THREADS = 2
+
+    @staticmethod
+    def threads_safe_limit() -> int:
+        """按 CPU 核心数给出「不会掉帧」的最大线程数。
+
+        实测（OCR 和模拟游戏同为 Normal，游戏每帧 16.7ms 干 10ms 活）：
+          4 核：2 线程就开始丢帧（最长间隔 37ms）
+          6 核：4 线程丢 7 帧（最长 41ms）
+          8 核：4 线程最长 21ms，不丢帧
+          24 核：4 线程 17ms，完全无感
+
+        所以 8 核以下不建议开 4 线程。ValoTalk 本身是 Below Normal 优先级，
+        实际会比这个测试更好，但按保守值给建议。
+        """
+        try:
+            import os
+            cores = os.cpu_count() or 4
+        except Exception:
+            cores = 4
+        if cores >= 8:
+            return 4
+        if cores >= 6:
+            return 2
+        return 1
+
+    def threads(self) -> int:
+        if self._threads is not None:
+            return self._threads
+        try:
+            n = int(self._get("ocr.onnx_threads", self.DEFAULT_THREADS)
+                    or self.DEFAULT_THREADS)
+        except (TypeError, ValueError):
+            n = self.DEFAULT_THREADS
+        if n not in self.SPEED_CHOICES:
+            n = self.DEFAULT_THREADS
+        self._threads = n
+        return n
+
+    def set_threads(self, n: int) -> bool:
+        """切换 OCR 线程数。
+
+        必须自己记住目标值 —— ensure_engine 重建引擎时读 threads()，
+        如果只依赖 config，外部没同步写就会用回旧线程数（实测三档耗时
+        一模一样，就是这个原因）。
+        """
+        n = int(n)
+        if n not in self.SPEED_CHOICES:
+            n = self.DEFAULT_THREADS
+        old = self.threads()
+        self._threads = n
+        _limit_onnx_threads(n, force=True)
+        reset_engine()
+        self._engine = None
+        self.kind = ""
+        return n != old
 
     # ---------------- 引擎 ----------------
     def ensure_engine(self) -> bool:
@@ -97,7 +185,7 @@ class ChatOCR:
             if self._engine is not None:
                 return True
             if want in ("auto", "rapidocr"):
-                eng = _load_rapidocr()
+                eng = _load_rapidocr(self.threads())
                 if eng is not None:
                     self._engine, self.kind = eng, "rapidocr"
                     return True

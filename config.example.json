@@ -56,10 +56,12 @@
       0,
       0
     ],
-    "interval_ms": 1200,
+    "interval_ms": 2500,
     "min_confidence": 0.5,
     "max_lines": 10,
-    "translate": true
+    "translate": true,
+    "idle_backoff_max": 4.0,
+    "onnx_threads": 2
   },
   "tts": {
     "engine": "edge",
@@ -98,7 +100,7 @@
     "panel_on_top": true
   },
   "remote": {
-    "enabled": true,
+    "enabled": false,
     "port": 8765,
     "token": "",
     "auto_token": true

@@ -169,6 +169,40 @@ class RoundButton(tk.Canvas):
         self._enabled = bool(ok)
         self._draw(self._fill)
 
+    def set_command(self, command) -> None:
+        """换绑点击回调（任务完成后把「更新」换成「重启」这类）。"""
+        self._command = command
+
+    def set_fill(self, fill: str) -> None:
+        """换底色（开关类按钮用：开启绿、关闭灰）。"""
+        self._fill = fill
+        self._draw(fill)
+
+
+class RoundProgress(tk.Canvas):
+    """圆角进度条。ttk.Progressbar 在 clam 主题下样式不跟配色走，自己画。"""
+
+    def __init__(self, master, width: int = 420, height: int = 8,
+                 fill: str = BLUE, track: str = CARD2, bg: str = BG, **kw):
+        super().__init__(master, width=width, height=height,
+                         highlightthickness=0, bd=0, bg=bg, **kw)
+        # 别用 self._w / self._h —— self._w 是 tkinter 内部的控件路径名，覆盖了会炸
+        self._bar_w, self._bar_h = width, height
+        self._fill, self._track = fill, track
+        self._value = 0.0
+        self._track_id = self.create_rectangle(
+            0, 0, width, height, fill=track, outline="")
+        self._bar_id = self.create_rectangle(
+            0, 0, 0, height, fill=fill, outline="")
+
+    def set_value(self, pct: float) -> None:
+        self._value = max(0.0, min(100.0, float(pct)))
+        w = self._bar_w * self._value / 100.0
+        self.coords(self._bar_id, 0, 0, w, self._bar_h)
+
+    def get_value(self) -> float:
+        return self._value
+
 
 class RoundEntry(tk.Frame):
     """圆角输入框：圆角背景 + 无边框 Entry。
@@ -300,7 +334,11 @@ class RoundCombo(tk.Frame):
 
 
 class ToggleRow(tk.Frame):
-    """iOS 风格开关行：左边文字，右边胶囊开关。"""
+    """iOS 风格开关行：左边文字，右边胶囊开关。
+
+    extra 是文字和开关之间的空位，调用方可以往里塞附加控件
+    （比如手机遥控的地址 + 二维码按钮），保持一行。
+    """
 
     def __init__(self, master, text: str, variable: tk.BooleanVar,
                  command=None, bg: str = CARD, **kw):
@@ -317,9 +355,17 @@ class ToggleRow(tk.Frame):
                                 highlightthickness=0, bd=0, bg=bg,
                                 cursor="hand2")
         self.switch.pack(side="right", padx=(10, 0))
+        # 中间扩展区（默认不占位，有子控件才显形）
+        self.extra = tk.Frame(self, bg=bg)
         self._draw()
         self.switch.bind("<Button-1>", self._toggle)
         self._label.bind("<Button-1>", self._toggle)
+
+    def pack_extra(self) -> None:
+        """把 extra 插到文字和开关之间。有内容时调一次即可。"""
+        if not self.extra.winfo_manager():
+            self.extra.pack(side="left", fill="x", expand=True,
+                            padx=(10, 0))
 
     def _draw(self) -> None:
         c = self.switch

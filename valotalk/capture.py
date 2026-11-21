@@ -177,6 +177,17 @@ class SileroSegmenter:
     为什么不用能量 VAD：实测打游戏时背景音乐/枪声让 64.8% 的帧都超过能量阈值，
     能量法师会把音乐和人声一起切成 9 秒大块，whisper 拿到的全是垃圾。
     Silero 能区分「人声 / 非人声」，只把人声片段送去做识别。
+
+    静音判定自适应（adaptive_gap）：
+      固定等 380ms 的问题是「安静时白等、枪战时又不够」——实测 0.1~0.08 噪声下
+      切段延迟全是 480ms，一点不变。
+      现在用「非语音部分的 RMS」当环境噪声估计，映射到等待时长：
+        安静  → 200ms（省约 280ms）
+        枪战  → 460ms（多等一点，换来不把话切断）
+      噪声估计走 EMA 平滑，等待时长还限速变化，避免抖动导致切段忽长忽短。
+
+    检查节奏也自适应（check_fast_ms）：一旦检测到语音且快说完了，
+    立刻切到 120ms 的加急轮询，不必干等 300ms 的常规周期。
     """
 
     def __init__(self, cfg: dict, sr: int = TARGET_SR):
@@ -186,10 +197,24 @@ class SileroSegmenter:
         # feed 在采集线程，flush 在热键/手机线程 —— 不加锁会抢 buf
         self._lock = threading.Lock()
         self.check_every = max(1, int(0.30 * sr))
+        self.check_fast = max(1, int(float(cfg.get("check_fast_ms", 120)) / 1000.0 * sr))
+        self._next_check = self.check_every
         self.min_speech_s = float(cfg.get("silero_min_speech_ms", 300)) / 1000.0
-        self.end_gap_s = float(cfg.get("silero_end_gap_ms", 380)) / 1000.0
         self.max_len_s = float(cfg.get("max_utterance_ms", 9000)) / 1000.0
         self.window_s = float(cfg.get("silero_window_s", 12.0))
+
+        # ---- 自适应静音判定 ----
+        self.adaptive = bool(cfg.get("adaptive_gap", True))
+        self.end_gap_s = float(cfg.get("silero_end_gap_ms", 380)) / 1000.0
+        self.gap_min_s = float(cfg.get("gap_min_ms", 200)) / 1000.0
+        self.gap_max_s = float(cfg.get("gap_max_ms", 420)) / 1000.0
+        self.noise_quiet = float(cfg.get("noise_quiet_rms", 0.005))
+        self.noise_loud = float(cfg.get("noise_loud_rms", 0.055))
+        self.noise_alpha = float(cfg.get("noise_smooth", 0.15))
+        self.gap_max_step = float(cfg.get("gap_max_step_ms", 60)) / 1000.0
+        self.noise_rms = self.noise_quiet          # 环境噪声估计（EMA）
+        self.cur_gap_s = self.gap_min_s if self.adaptive else self.end_gap_s
+
         self.ok = False
         self._fn = None
         self._opts = None
@@ -206,10 +231,76 @@ class SileroSegmenter:
         except Exception as exc:
             self.error = str(exc)
 
+    # ---------------- 自适应 ---------------- 
+    def _noise_outside(self, window: np.ndarray, spans) -> float:
+        """window 里「非语音部分」的 RMS —— 就是枪声/音乐/环境噪声的电平。
+
+        只取最近 0.8 秒：window 有 12 秒，用整段算会被几十秒前的枪战拖着，
+        枪声停了半天还认为在打仗。
+        """
+        if window.size == 0:
+            return self.noise_rms
+        tail_n = int(self.sr * 0.8)
+        recent = window[-tail_n:] if window.size > tail_n else window
+        base = window.size - recent.size
+
+        if not spans:
+            return float(np.sqrt(np.mean(recent ** 2) + 1e-12))
+
+        mask = np.ones(recent.size, dtype=bool)
+        for s in spans:
+            a = max(0, int(s["start"]) - base)
+            b = min(recent.size, int(s["end"]) - base)
+            if b > a:
+                mask[a:b] = False
+        if int(mask.sum()) < int(self.sr * 0.05):   # 非语音太短，估不准就用旧值
+            return self.noise_rms
+        seg = recent[mask]
+        return float(np.sqrt(np.mean(seg ** 2) + 1e-12))
+
+    def _target_gap(self, noise: float) -> float:
+        """噪声电平 → 该等多久。对数插值，因为响度是感知对数的。"""
+        if not self.adaptive:
+            return self.end_gap_s
+        lo, hi = self.noise_quiet, self.noise_loud
+        if noise <= lo:
+            return self.gap_min_s
+        if noise >= hi:
+            return self.gap_max_s
+        import math
+        t = ((math.log(noise) - math.log(lo))
+             / (math.log(hi) - math.log(lo)))
+        return self.gap_min_s + t * (self.gap_max_s - self.gap_min_s)
+
+    def _update_noise(self, noise: float) -> None:
+        # 非对称平滑：噪声变大时慢一点（别被单次枪声瞬间拉高），
+        # 变小时快一点（枪战结束了就该马上恢复灵敏）
+        a = max(0.02, min(1.0, self.noise_alpha))
+        if noise < self.noise_rms:
+            a = min(0.6, a * 3.0)
+        self.noise_rms = (1 - a) * self.noise_rms + a * noise
+        target = self._target_gap(self.noise_rms)
+        # 限速：一次最多变 gap_max_step，避免枪声一来等待时长猛跳
+        d = target - self.cur_gap_s
+        if d > self.gap_max_step:
+            d = self.gap_max_step
+        elif d < -self.gap_max_step:
+            d = -self.gap_max_step
+        self.cur_gap_s += d
+
+    @property
+    def stats(self) -> dict:
+        return {
+            "noise_rms": round(self.noise_rms, 4),
+            "gap_ms": int(self.cur_gap_s * 1000),
+            "adaptive": self.adaptive,
+        }
+
     def reset(self) -> None:
         with self._lock:
             self.buf = np.zeros(0, dtype=np.float32)
             self.since_check = 0
+            self._next_check = self.check_every
 
     def flush(self) -> np.ndarray | None:
         """接口与能量 VAD 保持一致：返回单个音频段或 None。"""
@@ -224,7 +315,7 @@ class SileroSegmenter:
         with self._lock:
             self.buf = np.concatenate([self.buf, pcm])
             self.since_check += pcm.size
-            if self.since_check < self.check_every:
+            if self.since_check < self._next_check:
                 return []
             self.since_check = 0
             return self._extract(self.buf)
@@ -242,14 +333,20 @@ class SileroSegmenter:
         spans = self._spans(window)
         dur = window.size / self.sr
 
+        # 每轮都用「非语音部分」更新环境噪声估计
+        self._update_noise(self._noise_outside(window, spans))
+
         if not spans:
+            self._next_check = self.check_every          # 没人说话，按常规节奏
             # 一直没人声：只保留最近 1 秒，别让缓冲无限长
             if audio.size > 2 * self.sr:
                 self.buf = audio[-self.sr:].copy()
             return []
 
         gap = dur - spans[-1]["end"] / self.sr
-        if not force and gap < self.end_gap_s and dur < self.max_len_s:
+        if not force and gap < self.cur_gap_s and dur < self.max_len_s:
+            # 检测到语音且还没等够：切加急轮询，别干等 300ms
+            self._next_check = self.check_fast
             return []                       # 还在说，继续等
 
         parts = [window[int(s["start"]):int(s["end"])] for s in spans]
@@ -257,6 +354,7 @@ class SileroSegmenter:
         # 消费掉已处理的部分，保留尾巴一点点，避免和下一段重叠
         tail = window[int(spans[-1]["end"]):]
         self.buf = tail[-self.check_every:].copy() if tail.size else np.zeros(0, np.float32)
+        self._next_check = self.check_every
 
         if speech < self.min_speech_s:
             return []
