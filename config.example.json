@@ -8,7 +8,14 @@
     "beam_size": 1,
     "cpu_threads": 2,
     "warmup": true,
-    "download_root": "models"
+    "download_root": "models",
+    "backend": "auto",
+    "cloud_model": "",
+    "cloud_timeout": 30,
+    "cloud_fallback": true,
+    "cloud_provider": "",
+    "cloud_base_url": "",
+    "cloud_api_key": ""
   },
   "audio": {
     "game_output_device": "",

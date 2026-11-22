@@ -1,5 +1,6 @@
 # ---- 本地配置：含 API key，绝不入库 ----
 config.json
+config.json.*
 config.local.json
 
 # ---- 模型权重 / 缓存 / 日志 ----
@@ -26,7 +27,11 @@ venv/
 Thumbs.db
 desktop.ini
 
-# ---- 诊断截图（含游戏画面/聊天）----
+# ---- 诊断截图（含游戏画面/聊天） ----
 *.png
 *.jpg
 !docs/*.png
+
+# ---- 发布用临时文件 ----
+.release_notes.md
+dist/

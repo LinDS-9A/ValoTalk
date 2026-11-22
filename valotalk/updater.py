@@ -50,6 +50,7 @@ UPDATE_FILES = [
     "valotalk/__main__.py",
     "valotalk/app.py",
     "valotalk/asr.py",
+    "valotalk/asr_cloud.py",
     "valotalk/capture.py",
     "valotalk/config.py",
     "valotalk/ocr.py",

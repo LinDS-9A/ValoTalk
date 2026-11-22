@@ -11,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from valotalk.app import App, Job  # noqa: E402
+from valotalk.config import CONFIG  # noqa: E402
 
 fails = 0
 
@@ -25,9 +26,19 @@ def ok(cond: bool, name: str, extra: str = "") -> None:
 
 
 def main() -> None:
+    from tools._cfg_guard import config_guard
+
+    with config_guard():
+        _run()
+
+
+def _run() -> None:
     app = App()
     app._running = True                     # 不启动采集/模型
     app.flags = {"team": True, "me": True, "chat": True}
+    # 显式锁定测试前提：英服链路（不依赖 config 上次被改成什么）
+    CONFIG.set("asr.lang_teammates", "en", save=False)
+    CONFIG.set("translate.backend", "auto", save=False)
 
     # TTS 不真播（避免往虚拟麦克风灌声音）
     spoken = []
@@ -44,6 +55,9 @@ def main() -> None:
     if app.overlay.items:
         it = app.overlay.items[-1]
         ok(it.tag == "队友", "标签正确", it.tag)
+        # 翻译失败时把底层错误打出来，别只报一句「翻译失败」
+        if app.translator.last_error:
+            print(f"      底层错误: {app.translator.last_error[:160]}")
         ok(bool(it.text) and "Rush" not in it.text, "已译成中文", it.text[:40])
 
     print("\n[2] 聊天：英文 → 中文")
@@ -53,15 +67,25 @@ def main() -> None:
     ok(any("聊天" in l for l in added), "日志含『聊天』")
     ok(app.overlay.items and app.overlay.items[-1].tag == "聊天", "字幕标签=聊天")
 
-    print("\n[3] 我说中文：中文 → 英文 → 触发 TTS")
+    print("\n[3] 我说中文 → 目标语言 → 触发 TTS")
+    # 目标语言跟着服务器走：英服→英文，日服→日语
+    server_lang = str(app._get("asr.lang_teammates", "en") or "en")
+    expect_ja = server_lang.startswith("ja")
     app._dispatch(Job(kind="me", text="掩护我，我要开大了"))
     app.root.update()
     added = app.log_lines[n0:]
     ok(any("我：" in l for l in added), "日志含『我：』")
     ok(len(spoken) >= 1, "TTS 被调用", spoken[-1][:60] if spoken else "(没调用)")
     if spoken:
-        ok(not any("\u4e00" <= c <= "\u9fff" for c in spoken[-1]),
-           "TTS 内容是英文", spoken[-1][:60])
+        has_zh = any("\u4e00" <= c <= "\u9fff" for c in spoken[-1])
+        if expect_ja:
+            # 日语输出：不该是中文（汉字和中文共用码位，只查假名更可靠）
+            has_kana = any(("\u3040" <= c <= "\u30ff") for c in spoken[-1])
+            ok(has_kana, f"TTS 内容是日语（服务器={server_lang}）",
+               spoken[-1][:60])
+        else:
+            ok(not has_zh, f"TTS 内容是英文（服务器={server_lang}）",
+               spoken[-1][:60])
     ok(app.overlay.items and app.overlay.items[-1].tag == "我", "字幕标签=我")
 
     print("\n[4] 关闭开关后不应再处理")

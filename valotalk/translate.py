@@ -217,7 +217,7 @@ class Translator:
         # 送翻译前把 "nt"/"mb" 这类缩写展开，否则 LLM 会译成「牛逼」这种
         send_text = expand_abbreviations(text) if src == "en" else text
         result = ""
-        for backend in self._backend_order():
+        for backend in self._backend_order(src, dst):
             try:
                 result = self._call(backend, send_text, src, dst)
             except Exception as exc:
@@ -272,12 +272,27 @@ class Translator:
             return self._via_mymemory(text, src, dst)
         return ""
 
-    def _backend_order(self) -> list[str]:
+    def _backend_order(self, src: str = "", dst: str = "") -> list[str]:
+        """按配置决定走哪个翻译通道。
+
+        **日语优先 LLM，不掺机翻**：机翻不认识游戏术语（实测 Bing 把
+        「オペレーター持ってる」译成「我有接线员，别接电话」，
+        「スポイク設置した」译成「已安装吸管」，「フランク」译成「弗兰克」）。
+        所以只要 LLM 可用，日→中 / 中→日 就只走 LLM。
+
+        只有在完全没配 LLM 时才退回机翻 —— 没译文比错译文好，但比没有强，
+        这种情况下 translate() 会在 last_error 里留下提示。
+        """
         want = (self._get("translate.backend", "auto") or "auto").lower()
         llm_ready = bool(self._get("translate.llm.base_url", "")) and bool(
             self._get("translate.llm.model", "")
         )
         base = ["bing", "google", "mymemory"]
+
+        ja_related = src.lower().startswith("ja") or dst.lower().startswith("ja")
+        if ja_related:
+            return ["llm"] if llm_ready else base
+
         if want == "llm":
             return (["llm"] if llm_ready else []) + base
         if want == "bing":
@@ -451,6 +466,11 @@ class Translator:
             "model": model,
             "temperature": 0.1,
             "max_tokens": 256,
+            # DeepSeek 默认开启思考模式：实测思考内容会占满 max_tokens，
+            # 导致「正文返回空」（finish_reason=length），而且慢 2.8 倍
+            # （1.35s vs 0.48s）。翻译不需要推理，直接关掉。
+            # 不认这个参数的接口会 400，下面自动降级重试。
+            "thinking": {"type": "disabled"},
             "messages": [
                 {"role": "system", "content": sys_content},
                 {"role": "user", "content": ask + text},
@@ -462,17 +482,39 @@ class Translator:
         timeout = float(self._get("translate.llm.timeout", 10))
         r = self._session.post(url, data=json.dumps(payload), headers=headers,
                                timeout=timeout)
-        if r.status_code == 400 and use_cache:
-            # 有些兼容接口不认 content 数组 / cache_control，退回纯字符串重试
-            payload["messages"][0]["content"] = _LLM_SYSTEM
-            r = self._session.post(url, data=json.dumps(payload), headers=headers,
-                                   timeout=timeout)
+        # 兼容降级：不认 thinking / cache_control 的接口逐个去掉重试
+        if r.status_code in (400, 422):
+            changed = False
+            if "thinking" in payload:
+                payload.pop("thinking")
+                changed = True
+            if use_cache:
+                payload["messages"][0]["content"] = _LLM_SYSTEM
+                changed = True
+            if changed:
+                r = self._session.post(url, data=json.dumps(payload),
+                                       headers=headers, timeout=timeout)
         r.raise_for_status()
         data = r.json()
         # 把缓存命中情况记下来，方便在日志里看省钱效果
         usage = data.get("usage", {}) or {}
         self.last_usage = usage
-        return (data["choices"][0]["message"]["content"] or "").strip().strip('"“”')
+        choice = (data.get("choices") or [{}])[0]
+        out = ((choice.get("message") or {}).get("content") or "").strip()
+        out = out.strip('"“”')
+        # 万一还是被思考吃掉了配额（返回空 + finish_reason=length），
+        # 放宽 max_tokens 再来一次，别让用户看到空白
+        if not out and choice.get("finish_reason") == "length":
+            payload.pop("thinking", None)
+            payload["max_tokens"] = 512
+            r = self._session.post(url, data=json.dumps(payload),
+                                   headers=headers, timeout=timeout)
+            if r.status_code == 200:
+                d2 = r.json()
+                self.last_usage = d2.get("usage", {}) or usage
+                out = (((d2.get("choices") or [{}])[0].get("message") or {})
+                       .get("content") or "").strip().strip('"“”')
+        return out
 
 
 def _short(exc: Exception) -> str:

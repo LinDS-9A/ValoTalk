@@ -24,6 +24,23 @@ DEFAULTS: dict = {
         "cpu_threads": 2,              # 别让推理线程池吃满所有核心
         "warmup": True,
         "download_root": str(MODELS_DIR),
+        # 识别后端：local / cloud
+        #   local = 本地 faster-whisper（不上传，英服 121ms）
+        #   cloud = 大模型 ASR（更准，英文 392ms / 日语 352ms）
+        # 面板上有「大模型识别」开关直接切，两个服务器都生效。
+        "backend": "cloud",
+        # 云端 ASR 服务商：deepseek / dashscope / openai
+        #   留空则按 cloud_base_url 自动判断
+        #   DeepSeek   → POST {base}/tools/asr
+        #   dashscope  → 百炼原生多模态（qwen3-asr-flash）
+        #   openai     → POST {base}/audio/transcriptions（OpenAI / 硅基流动 /
+        #                火山 / 自建 whisper-server 都走这个）
+        "cloud_provider": "",
+        "cloud_base_url": "",          # 留空用该服务商的默认地址
+        "cloud_model": "",             # 留空用默认（dashscope 是 qwen3-asr-flash）
+        "cloud_api_key": "",           # 留空则复用 translate.llm.api_key
+        "cloud_timeout": 30,
+        "cloud_fallback": True,        # 云端失败时自动退回本地
     },
     "audio": {
         "game_output_device": "",      # 游戏声音输出（loopback 采集源，通常=耳机）

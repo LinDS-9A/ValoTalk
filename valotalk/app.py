@@ -26,6 +26,7 @@ import numpy as np
 from . import __version__
 from . import capture, remote, ui_theme as ui, updater, winapi
 from .asr import WhisperASR
+from .asr_cloud import CloudASR, fix_ja_terms
 from .config import CONFIG
 from .ocr import ChatOCR, LineDiffer, is_player_chat
 from .overlay import Overlay
@@ -145,6 +146,7 @@ class Job:
     pcm: np.ndarray | None = None
     text: str = ""            # chat 已有文本
     detected_lang: str | None = None   # 自动检测出的语种
+    asr_backend: str = ""     # cloud / local，用于日志和统计
     t0: float = field(default_factory=time.time)
 
 
@@ -158,6 +160,8 @@ class App:
         self.log_lines: list[str] = []
 
         self.asr = WhisperASR(self._get)
+        # 云端大模型 ASR（日服默认用，更准）
+        self.asr_cloud = CloudASR(self._get, log=self.log)
         self.translator = Translator(self._get)
         self.tts = TTS(self._get, log=self.log)
         self.ocr = ChatOCR(self._get)
@@ -202,6 +206,8 @@ class App:
         self.overlay.on_moved = lambda _x, _y: self._refresh_pos_label()
         # overlay 建好之后才能读到实际坐标
         self._refresh_pos_label()
+        # 显示当前识别/翻译通道（日服默认大写大模型链路）
+        self._refresh_asr_mode_label()
 
         # 自动更新：启动后隔 4s 查（别和模型加载抢带宽）
         self.updater = updater.Updater(self._get, log=self.log)
@@ -300,6 +306,10 @@ class App:
         sc.pack(side="left")
         sc.bind_select(self._on_server_change)
         self.cb_server = sc
+        # 日服会切到大模型链路，标出来让用户知道音频会上传
+        self.asr_mode_lbl = tk.Label(row, text="", bg=ui.CARD, fg=ui.TEXT3,
+                                     font=(ui.FONT, 8), anchor="w")
+        self.asr_mode_lbl.pack(side="left", padx=(6, 0))
 
         # 音色
         row2 = tk.Frame(body, bg=ui.CARD)
@@ -375,6 +385,7 @@ class App:
         self.v_through = tk.BooleanVar(value=bool(self._get("overlay.click_through", True)))
         self.v_cpu = tk.BooleanVar(value=str(self._get("asr.device", "auto")) == "cpu")
         self.v_remote = tk.BooleanVar(value=bool(self._get("remote.enabled", False)))
+        self.v_big_asr = tk.BooleanVar(value=self._use_cloud_asr())
 
         for text, var, cb in [
             ("队友语音 → 中文字幕", self.v_team,
@@ -387,6 +398,7 @@ class App:
              lambda: self._set("overlay.show_original", self.v_orig.get())),
             ("字幕穿透鼠标", self.v_through, self._on_through_toggle),
             ("识别用 CPU（不抢显卡）", self.v_cpu, self._on_cpu_toggle),
+            ("大模型识别（更准）", self.v_big_asr, self._on_big_asr_toggle),
             ("手机遥控", self.v_remote, self._on_remote_toggle),
         ]:
             tr = ui.ToggleRow(b2, text, var, command=cb)
@@ -395,6 +407,15 @@ class App:
                 self.chk_me = tr
             elif var is self.v_remote:
                 self.chk_remote = tr
+            elif var is self.v_big_asr:
+                self.chk_big_asr = tr
+
+        # 大模型识别：显示当前服务商，没配 key 时提示
+        self.big_asr_lbl = tk.Label(
+            self.chk_big_asr.extra, text="", bg=ui.CARD, fg=ui.TEXT3,
+            font=(ui.FONT, 8), anchor="w")
+        self.big_asr_lbl.pack(side="left")
+        self.chk_big_asr.pack_extra()
 
         # 手机遥控的地址 + 二维码，塞在同一行的文字和开关之间
         self.remote_lbl = tk.Label(self.chk_remote.extra, text="未开启",
@@ -760,6 +781,33 @@ class App:
         if not quiet:
             self.log("已自动识别设备，可在上面手动改。")
 
+    def _refresh_asr_mode_label(self, lang: str = "") -> None:
+        """把当前识别/翻译通道显示在服务器那一行。"""
+        lang = lang or str(self._get("asr.lang_teammates", "en") or "en")
+        cloud = self._use_cloud_asr(lang)
+        ja = lang.startswith("ja")
+        if cloud:
+            # 显示具体服务商，让用户知道音频发到哪
+            who = self.asr_cloud.describe() or "云端"
+            txt, color = f"☁ {who} + LLM 翻译", ui.BLUE
+            tip = "音频会上传到该服务"
+        elif not self.asr_cloud.available():
+            txt, color = "本地识别 · 没配 API key", ui.ORANGE
+            tip = ""
+        elif ja:
+            txt, color = "本地识别 + LLM 翻译", ui.TEXT3
+            tip = ""
+        else:
+            txt, color = "本地识别", ui.TEXT3
+            tip = ""
+        try:
+            self.asr_mode_lbl.configure(text=txt, fg=color)
+        except Exception:
+            pass
+        if tip:
+            self.log(f"[识别] {txt}（{tip}）")
+        self._refresh_big_asr_label()
+
     def _on_server_change(self) -> None:
         label = self.cb_server.get()
         lang = SERVER_BY_LABEL.get(label, "en")
@@ -768,6 +816,24 @@ class App:
         name = {"en": "英语", "ja": "日语"}.get(lang, lang)
         self.log(f"游戏服务器：{label} → 队友语音按{name}识别，"
                  f"我说的中文翻成{name}")
+        self._refresh_asr_mode_label(lang)
+
+        # 日服切到大模型链路：云端 ASR + LLM 翻译（机翻不懂日语游戏术语）
+        if lang.startswith("ja"):
+            if self._use_cloud_asr(lang):
+                threading.Thread(target=self._warm_cloud_asr, daemon=True).start()
+            else:
+                self.log("[提示] 未配置 LLM API key，日服无法使用云端识别与 "
+                         "LLM 翻译；机翻对日语术语很不准，建议先填 key")
+            self.log("[翻译] 日服模式：只走 LLM，不降级到机翻")
+
+    def _warm_cloud_asr(self) -> None:
+        if self.asr_cloud.warmed:
+            return
+        if self.asr_cloud.warmup():
+            self.log(f"[云端ASR] {self.asr_cloud.describe()} 已就绪")
+        else:
+            self.log(f"[云端ASR] 预热失败：{self.asr_cloud.last_error}")
 
     def _refresh_voice_group(self, lang: str) -> None:
         """切换服务器时把音色列表换成对应语言的，并自动选默认音色。"""
@@ -960,6 +1026,45 @@ class App:
             self.log(f"[OCR] ⚠ 你的 CPU 是 {cores} 核，{threads} 线程可能让游戏掉帧"
                      f"（实测 6 核会丢 7 帧）；建议用「{ChatOCR.SPEED_CHOICES[safe]}」")
         self.log("[OCR] 引擎重建中，下一句聊天识别会稍慢")
+
+    # ============================================================ 大模型识别
+    def _on_big_asr_toggle(self) -> None:
+        """「大模型识别」开关：两个服务器都生效。"""
+        want = bool(self.v_big_asr.get())
+        if want and not self.asr_cloud.available():
+            # 没 key 就别让开关停在"开着但用不了"
+            self.v_big_asr.set(False)
+            self._set("asr.backend", "local")
+            self.log("[识别] 没配 LLM API key，无法使用大模型识别")
+            self.log("       在「聊天区域 & 翻译后端」里填 LLM 的 base_url / 模型 / 密钥")
+            self._refresh_big_asr_label()
+            self._refresh_asr_mode_label()
+            return
+
+        self._set("asr.backend", "cloud" if want else "local")
+        if want:
+            self.log("[识别] 已切换到大模型识别（音频会发送到 "
+                     f"{self.asr_cloud.describe()}）")
+            threading.Thread(target=self._warm_cloud_asr, daemon=True).start()
+        else:
+            self.log("[识别] 已切换回本地识别（不上传音频）")
+        self._refresh_big_asr_label()
+        self._refresh_asr_mode_label()
+
+    def _refresh_big_asr_label(self) -> None:
+        """开关旁边显示当前服务商 / 提示。"""
+        def apply():
+            try:
+                if not self.asr_cloud.available():
+                    self.big_asr_lbl.configure(text="未配 key", fg=ui.ORANGE)
+                elif self._use_cloud_asr():
+                    self.big_asr_lbl.configure(
+                        text=self.asr_cloud.describe(), fg=ui.BLUE)
+                else:
+                    self.big_asr_lbl.configure(text="用本地 whisper", fg=ui.TEXT3)
+            except Exception:
+                pass
+        self._uiq.put(apply)
 
     # ============================================================ 手机遥控
     def _on_remote_toggle(self) -> None:
@@ -1200,6 +1305,14 @@ class App:
         if not ok:
             self.log("[模型] 加载失败：" + (self.asr.load_error or ""))
             self.log("       先跑 setup.ps1 装依赖，或把 asr.model 改小（base/tiny）。")
+        # 1.5) 云端 ASR 预热：不预热的话第一句话要多等 3 秒（TLS 握手）
+        lang = str(self._get("asr.lang_teammates", "en") or "en")
+        if self._use_cloud_asr(lang):
+            if self.asr_cloud.warmup():
+                self.log(f"[云端ASR] {self.asr_cloud.describe()} 就绪"
+                         f"（音频会发送到该服务识别）")
+            else:
+                self.log(f"[云端ASR] {self.asr_cloud.last_error}，降级用本地识别")
         # 2) 采集
         self._start_capture()
         # 3) 常用喊话的英文语音先合成好，游戏里命中时零延迟
@@ -1299,9 +1412,6 @@ class App:
                 continue
             if job is None:
                 continue
-            # 模型失效（比如 CUDA 库缺失）时按节奏重试，不要每句都炸
-            if not self.asr.loaded and not self._reload_asr():
-                continue
             # 队友语音：按界面选定的服区固定语种，不做自动检测
             if job.kind == "teammates":
                 lang = str(self._get("asr.lang_teammates", "en") or "en")
@@ -1309,16 +1419,11 @@ class App:
                     lang = "en"
             else:
                 lang = self._get("asr.lang_me", "zh")
-            try:
-                text = self.asr.transcribe(job.pcm, lang)
-            except Exception as exc:
-                self.log(f"[识别异常] {exc}")
-                continue
+
+            text = self._transcribe(job, lang)
             if not text:
                 continue
             job.text = text
-            # 自动检测出来的语种留给翻译层用（给 LLM 一个上下文提示）
-            job.detected_lang = getattr(self.asr, "last_language", None)
             try:
                 self.post_q.put_nowait(job)
             except queue.Full:
@@ -1327,6 +1432,63 @@ class App:
                     self.post_q.put_nowait(job)
                 except Exception:
                     pass
+
+    def _use_cloud_asr(self, lang: str = "") -> bool:
+        """该不该用大模型（云端）识别。
+
+        面板上的「大模型识别」开关直接控制，两个服务器都生效：
+          cloud → 用云端（前提是配了 key）
+          local → 用本地
+        兼容老配置：auto 视为 cloud（原来日服自动走云端）。
+        """
+        want = str(self._get("asr.backend", "cloud") or "cloud").lower()
+        if want in ("local", "off", "false"):
+            return False
+        return self.asr_cloud.available()
+
+    def _transcribe(self, job: Job, lang: str) -> str:
+        """按配置选后端。云端失败且允许回退时用本地。"""
+        text = ""
+        if self._use_cloud_asr(lang):
+            text = self.asr_cloud.transcribe(job.pcm, lang)
+            if text:
+                job.asr_backend = "cloud"
+            else:
+                err = self.asr_cloud.last_error or "返回空"
+                if self._get("asr.cloud_fallback", True):
+                    now = time.time()
+                    if now - getattr(self, "_cloud_warn_at", 0) > 60:
+                        self._cloud_warn_at = now
+                        self.log(f"[云端ASR] 失败（{err}），本次改用本地识别")
+                else:
+                    self.log(f"[云端ASR] 失败：{err}")
+                    return ""
+
+        if not text:
+            # 本地
+            if not self.asr.loaded and not self._reload_asr():
+                return ""
+            try:
+                text = self.asr.transcribe(job.pcm, lang)
+            except Exception as exc:
+                self.log(f"[识别异常] {exc}")
+                return ""
+            if text:
+                job.asr_backend = "local"
+
+        if not text:
+            return ""
+
+        # 日语同音字纠正（ウルト→売ると 这类），云端和本地都适用
+        if lang.startswith("ja"):
+            fixed = fix_ja_terms(text)
+            if fixed != text:
+                self.log(f"[纠错] {text} → {fixed}")
+                text = fixed
+
+        job.detected_lang = lang if job.asr_backend == "cloud" else \
+            (getattr(self.asr, "last_language", None) or lang)
+        return text
 
     def _reload_asr(self) -> bool:
         """失效后重建，最多每 10 秒试一次。"""
@@ -1358,9 +1520,12 @@ class App:
             if not self.flags["team"]:
                 return
             src = job.detected_lang or self._get("asr.lang_teammates", "en") or "en"
+            tag = ""
+            if job.asr_backend == "cloud":
+                tag = "〔云〕"
             zh = self.translator.translate(job.text, src, "zh-CN")
             shown = zh or "（翻译失败）" + job.text
-            self.log(f"队友：{job.text} → {zh}")
+            self.log(f"队友：{job.text} → {zh} {tag}".rstrip())
             self._overlay("队友", shown, job.text if zh else "")
         elif job.kind == "me":
             if not self.flags["me"] or self._muted_outgoing:
