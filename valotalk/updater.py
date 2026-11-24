@@ -36,6 +36,9 @@ REMOTE_REPO = "LinDS-9A/ValoTalk"
 # 改用 data.jsdelivr.com 的版本列表 API（立即更新），下载用 @tag 固定版本号。
 CDN = f"https://cdn.jsdelivr.net/gh/{REMOTE_REPO}"
 VERSIONS_API = f"https://data.jsdelivr.com/v1/packages/gh/{REMOTE_REPO}"
+# GitHub API：新 tag 比 jsdelivr 版本列表更新得及时，还直接给 prerelease 标记。
+# 不传 token（未认证 60 次/小时），限流了就当拿不到，不影响主流程。
+GH_API = "https://api.github.com"
 
 
 def _tag_url(version: str, path: str) -> str:
@@ -162,24 +165,29 @@ class Updater:
     def check(self, timeout: float = 12.0) -> UpdateInfo | None:
         """有新版返回 UpdateInfo，已最新/失败返回 None。
 
-        两条路：
-        1) data.jsdelivr.com 版本列表 API（实时，实测发布后立即能查到）
-        2) 兜底：逐个 tag 读 valotalk/__init__.py（@tag 实时拉，无缓存延迟）
-        都不用 @main —— 它有 CDN 缓存延迟。
+        版本号来源有两个，取较新的那个：
+        1) data.jsdelivr.com 版本列表 —— 快、没有频率限制，
+           但**新 tag 有索引延迟**（实测发完 3.0.1-beta 十几分钟后还查不到）
+        2) GitHub Releases API —— 实时，还直接给出 prerelease 标记，
+           但未认证时每小时只有 60 次（每次启动查 1 次，够用）
+
+        只看 jsdelivr 会漏掉刚发的版本，所以两个都比一遍。
         """
         self.last_error = ""
-        remote = self._latest_version(timeout)
-        if remote is None:
+        found = self._latest_version(timeout)
+        if not found:
             if not self.last_error:
                 self.last_error = "连不上更新服务器"
             return None
+        remote, pre = found
         local = self.local_version()
         if parse_version(remote) <= parse_version(local):
             return None
+        # GitHub 给了准确标记就用它；只从 jsdelivr 拿到时才去读远端 __init__.py
         return UpdateInfo(version=remote,
                           notes=self._fetch_notes(remote),
                           files=list(UPDATE_FILES),
-                          prerelease=self._fetch_prerelease(remote))
+                          prerelease=bool(pre) or self._fetch_prerelease(remote))
 
     def _fetch_prerelease(self, version: str) -> bool:
         """远端那一版是不是测试版。
@@ -199,26 +207,72 @@ class Updater:
             return False
         return re.search(r"^\s*PRERELEASE\s*=\s*True", text, re.M) is not None
 
-    def _latest_version(self, timeout: float) -> str | None:
-        """远端最新版本号。"""
+    def _latest_version(self, timeout: float) -> tuple[str, bool] | None:
+        """远端最新版本号 → (版本, 是否测试版)；查不到返回 None。
+
+        两个来源各自给出候选，按 parse_version 比大小取较新的。
+        """
+        best = ""
+        best_pre = False
+
+        # ---- 来源一：jsdelivr 版本列表 ----
         raw = _get_retry(VERSIONS_API, tries=2, timeout=timeout)
         if raw:
             try:
                 data = json.loads(raw.decode("utf-8", "ignore"))
                 vs = [v.get("version", "") for v in data.get("versions", [])]
                 vs = [v for v in vs if v]
-                # 排除 beta/prerelease？保留 beta 标签由用户选择。这里全取，
-                # 按数字比出最大的即可
-                best = ""
                 for v in vs:
                     if parse_version(v) > parse_version(best):
                         best = v
-                if best:
-                    return best
             except Exception as exc:
                 self.last_error = f"版本列表解析失败：{exc}"
-        # 兜底：从已知版本号列表里探
-        return None
+
+        # ---- 来源二：GitHub Releases（更新更及时，且带 prerelease 标记）----
+        gh = self._latest_from_github(timeout)
+        if gh:
+            gv, gpre = gh
+            if parse_version(gv) > parse_version(best):
+                best, best_pre = gv, gpre
+            elif gv and parse_version(gv) == parse_version(best) and gv == best:
+                # 同版本时以 GitHub 的标记为准
+                best_pre = gpre
+
+        if not best:
+            return None
+        return best, best_pre
+
+    def _latest_from_github(self, timeout: float) -> tuple[str, bool] | None:
+        """从 GitHub Releases API 取最新非草稿版本的 (版本号, 是否预发布)。
+
+        不传 token：未认证每小时 60 次，够用；拿不到就返回 None 让
+        jsdelivr 的结果兜着，不影响主流程。
+        """
+        raw = _get(f"{GH_API}/repos/{REMOTE_REPO}/releases?per_page=10",
+                   timeout=timeout)
+        if not raw:
+            return None
+        try:
+            items = json.loads(raw.decode("utf-8", "ignore"))
+        except Exception:
+            return None
+        if not isinstance(items, list):
+            return None
+        best = ""
+        best_pre = False
+        for it in items:
+            if not isinstance(it, dict) or it.get("draft"):
+                continue
+            tag = str(it.get("tag_name") or "")
+            v = tag[1:] if tag.startswith("v") else tag
+            if not v or not parse_version(v):
+                continue
+            if parse_version(v) > parse_version(best):
+                best = v
+                best_pre = bool(it.get("prerelease"))
+        if not best:
+            return None
+        return best, best_pre
 
     def local_version(self) -> str:
         from . import __version__
