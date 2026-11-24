@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import tkinter as tk
+from tkinter import font as tkfont
 from tkinter import ttk
 
 from PIL import Image, ImageColor, ImageDraw, ImageFilter, ImageTk
@@ -1182,52 +1183,322 @@ class RoundEntry(tk.Frame):
             self._apply_ph()
 
 
-class RoundCombo(tk.Frame):
-    """圆角下拉框：圆角背景 + 无边框 Combobox。"""
+class RoundCombo(tk.Canvas):
+    """自绘圆角玻璃下拉框。
+
+    为什么不用 ttk.Combobox：它有两处没法看 ——
+    · 主控件顶部那条白带：glass_image 的 highlight 在 30px 高的控件上
+      就是 3px 宽的白高光，浅色背景上像贴了张白条
+    · 点开的列表是原生 Listbox：直角、纯白底、选中色是系统蓝，
+      和周围的圆角玻璃完全不搭
+
+    所以整块自己画：
+    · 主控件 —— 圆角玻璃（不带高光）+ 左对齐文字 + 自绘小箭头
+    · 弹出层 —— 独立 Toplevel，圆角 + 暗边，每项 create_text 排，
+      鼠标经过画圆角浅蓝高亮，当前值前面打勾
+    · 项多时滚轮可滚
+
+    对外接口和原来一致：get / set / set_values / bind_select / var / [values]
+    """
+
+    ROW_H = 28          # 每项高度（实际按文本量算，这是下限）
+    PAD = 8             # 弹出层上下留白
 
     def __init__(self, master, values: list[str], width: int = 200,
                  height: int = 30, radius: int = BTN_RADIUS,
                  fill: str = CARD2, readonly: bool = True,
                  bg: str = CARD, **kw):
-        super().__init__(master, bg=bg, **kw)
-        self.canvas = tk.Canvas(self, width=width, height=height,
-                                highlightthickness=0, bd=0, bg=bg)
-        self.canvas.pack()
-        photo = glass_image(width, height, radius,
-                            top="#%02X%02X%02X" % _mix(fill, "#FFFFFF", 0.09),
-                            bottom="#%02X%02X%02X" % _mix(fill, "#000000", 0.10),
-                            edge=0.09, highlight=0.10,
-                            outside_color=bg)
-        self.canvas.create_image(0, 0, anchor="nw", image=photo)
-        self._photo = photo
+        super().__init__(master, width=width, height=height,
+                         highlightthickness=0, bd=0, bg=bg,
+                         cursor="hand2", **kw)
+        # 注意：不能叫 _w / _h —— 那是 tkinter Widget 内部属性
+        self._cw, self._ch = int(width), int(height)
+        self._radius = radius
+        self._fill = fill
+        self._bg = bg
+        self._readonly = readonly
+        self._ph = None
+        self._values = [str(v) for v in values]
+        self.var = tk.StringVar(value=self._values[0] if self._values else "")
+        self._on_select = None
+        self._pop = None
+        self._pop_cv = None
+        self._pop_photo = None
+        self._scroll = 0
+        self._row_h = []
+        self._geom = []
+        self._pop_w = int(width)
+        self._pop_h = 0
+        self._draw()
+        self.bind("<Button-1>", self._toggle)
+        self.var.trace_add("write", lambda *_a: self._draw())
 
-        style = ttk.Style()
-        # clam 主题的 Combobox 自带 lightcolor/darkcolor/bordercolor 三个亮边，
-        # 只设 borderwidth=0 去不掉，必须把三种颜色都压成同一个填充色
-        style.configure("Rounded.TCombobox",
-                        fieldbackground=fill, background=fill, foreground=TEXT,
-                        arrowcolor=TEXT2, borderwidth=0, relief="flat", padding=0,
-                        bordercolor=fill, lightcolor=fill, darkcolor=fill,
-                        insertcolor=TEXT)
-        style.map("Rounded.TCombobox",
-                  fieldbackground=[("readonly", fill), ("active", fill)],
-                  background=[("readonly", fill), ("active", fill)],
-                  foreground=[("readonly", TEXT)],
-                  selectbackground=[("readonly", fill)],
-                  selectforeground=[("readonly", TEXT)],
-                  bordercolor=[("readonly", fill), ("active", fill)],
-                  lightcolor=[("readonly", fill), ("active", fill)],
-                  darkcolor=[("readonly", fill), ("active", fill)],
-                  arrowcolor=[("readonly", TEXT2), ("active", TEXT)])
+    # ---------------------------------------------------------------- 主控件
+    def _fit_text(self, text: str, max_w: int) -> str:
+        """太长就截断加省略号，保证永远单行。"""
+        text = str(text or "")
+        if not text or max_w <= 8:
+            return text
+        try:
+            if not hasattr(self, "_fnt"):
+                self._fnt = tkfont.Font(font=(FONT, FS))
+            f = self._fnt
+            if f.measure(text) <= max_w:
+                return text
+            lo, hi = 0, len(text)
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if f.measure(text[:mid] + "…") <= max_w:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            return (text[:lo] + "…") if lo > 0 else "…"
+        except Exception:
+            return text
 
-        self.var = tk.StringVar()
-        self.combo = ttk.Combobox(self.canvas, textvariable=self.var, values=values,
-                                  state="readonly" if readonly else "normal",
-                                  style="Rounded.TCombobox", font=(FONT, FS))
-        self.canvas.create_window(10, height // 2, anchor="w", window=self.combo,
-                                  width=max(30, width - 20), height=height - 8)
-        self._values = list(values)
+    def _draw(self) -> None:
+        self.delete("all")
+        # highlight=0：这块不画顶部高光，否则就是那条白带。
+        # 用极轻的上下渐变 + 暗细边表达「凹进去的输入框」。
+        photo = glass_image(self._cw, self._ch, self._radius,
+                            top=self._fill,
+                            bottom="#%02X%02X%02X" % _mix(
+                                self._fill, "#000000", 0.07),
+                            edge=0.18, highlight=0.0, inner_shadow=0.14,
+                            outside_color=self._bg)
+        self._ph = photo
+        self.create_image(0, 0, anchor="nw", image=photo)
 
+        arrow_w = 20
+        pad = 11
+        # 单行 + 超长省略：「变声器输出 (VB-Audio Virtual Cable)」这种
+        # 折成两行会溢出 30px 高的控件，下拉框本来就该是一行
+        avail = max(24, self._cw - pad - arrow_w - 4)
+        text = self._fit_text(self.var.get(), avail)
+        self.create_text(pad, self._ch // 2, anchor="w", text=text,
+                         fill=TEXT, font=(FONT, FS))
+        # 小箭头：两条线折成 V，比默认三角轻
+        cx, cy = self._cw - 13, self._ch / 2 - 1
+        self.create_line(cx - 4, cy - 2, cx, cy + 2.5, cx + 4, cy - 2,
+                         fill=TEXT2, width=1.6, capstyle="round",
+                         joinstyle="round")
+
+    # ---------------------------------------------------------------- 弹出层
+    def _toggle(self, _e=None) -> None:
+        if self._pop is not None:
+            self._close()
+        else:
+            self._open()
+
+    def _measure_rows(self, text_w: int) -> list[int]:
+        """量每一项排完要占多高。
+
+        必须量：像「变声器输出 (VB-Audio Virtual Cable)」这种长名字在
+        窄下拉里会折成两行，行高固定 28 就会互相压字（实测就是这样）。
+        """
+        meas = tk.Canvas(self)
+        out = []
+        try:
+            for v in self._values:
+                it = meas.create_text(0, 0, anchor="nw", text=v,
+                                      font=(FONT, FS), width=text_w)
+                bb = meas.bbox(it)
+                h = (bb[3] - bb[1]) if bb else 18
+                out.append(max(26, h + 10))
+        except Exception:
+            out = [28] * len(self._values)
+        finally:
+            try:
+                meas.destroy()
+            except Exception:
+                pass
+        return out
+
+    def _open(self) -> None:
+        if not self._values or self._pop is not None:
+            return
+        w = max(self._cw, 140)
+        text_w = max(60, w - self.PAD * 2 - 26)
+        self._row_h = self._measure_rows(text_w)
+        total = sum(self._row_h) + self.PAD * 2
+        h = min(total, 340)
+        self._pop_h = h
+        self._pop_w = w
+
+        x = self.winfo_rootx()
+        y = self.winfo_rooty() + self._ch + 4
+        try:
+            sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        except Exception:
+            sw = sh = 0
+        if sh and y + h > sh - 10:
+            y = max(8, self.winfo_rooty() - h - 4)
+        if sw and x + w > sw - 10:
+            x = max(8, sw - w - 10)
+
+        top = tk.Toplevel(self)
+        try:
+            top.overrideredirect(True)
+        except Exception:
+            pass
+        try:
+            top.attributes("-topmost", True)
+        except Exception:
+            pass
+
+        # 不用 -transparentcolor：圆角是抗锯齿画的，边缘像素会和透明色
+        # 混成一道粉边（实测四个角都有）。这里直接把圆角外画成面板色，
+        # 浅色界面下面板和它所在卡片同色，四角看不出差异
+        try:
+            top.configure(bg=CARD)
+            top.geometry(f"{w}x{h}+{x}+{y}")
+        except Exception:
+            pass
+
+        cv = tk.Canvas(top, width=w, height=h, highlightthickness=0, bd=0,
+                       bg=CARD, cursor="hand2")
+        cv.pack(fill="both", expand=True)
+
+        photo = round_image(w, h, 13, CARD, outline="#9AA0AE",
+                            outside=CARD)
+        cv.create_image(0, 0, anchor="nw", image=photo)
+        cv._bg_photo = photo          # 防 GC
+
+        self._pop = top
+        self._pop_cv = cv
+        self._hl = cv.create_rectangle(0, 0, 0, 0, fill="#DCE9FF",
+                                       outline="", state="hidden")
+        self._geom = []
+        self._layout()
+
+        cv.bind("<Motion>", self._on_motion)
+        cv.bind("<Button-1>", self._on_click)
+        cv.bind("<ButtonRelease-1>", self._on_click)
+        cv.bind("<MouseWheel>", self._on_wheel)
+        cv.bind("<Leave>", lambda _e: cv.itemconfigure(self._hl,
+                                                       state="hidden"))
+        top.bind("<Escape>", lambda _e: self._close())
+        try:
+            self.winfo_toplevel().bind_all("<Button-1>", self._maybe_close,
+                                           add="+")
+        except Exception:
+            pass
+        try:
+            top.focus_force()
+        except Exception:
+            pass
+
+    def _layout(self) -> None:
+        """从 self._scroll 开始往下排，装不下就停（剩下的靠滚轮）。"""
+        cv = self._pop_cv
+        if cv is None:
+            return
+        cv.delete("row")
+        self._geom = []
+        cur = self.var.get()
+        avail = self._pop_h - self.PAD * 2
+        y = float(self.PAD)
+        used = 0.0
+        text_w = max(60, self._pop_w - self.PAD * 2 - 26)
+        for i in range(self._scroll, len(self._values)):
+            rh = self._row_h[i] if i < len(self._row_h) else 28
+            if used + rh > avail + 0.5:
+                break
+            v = self._values[i]
+            cv.create_text(self.PAD + 22, y + rh / 2, anchor="w", text=v,
+                           fill=TEXT, font=(FONT, FS), width=text_w,
+                           tags=("row",))
+            if v == cur:
+                mid = y + rh / 2
+                cv.create_line(self.PAD + 6, mid,
+                               self.PAD + 9, mid + 3.2,
+                               self.PAD + 13, mid - 3.2,
+                               fill=BLUE, width=1.8, capstyle="round",
+                               joinstyle="round", tags=("row",))
+            self._geom.append((y, y + rh, i))
+            y += rh
+            used += rh
+
+    def _visible(self) -> int:
+        return len(self._geom) or 1
+
+    def _index_at(self, y) -> int:
+        for y0, y1, i in self._geom:
+            if y0 <= y < y1:
+                return i
+        return -1
+
+    def _on_motion(self, e) -> None:
+        if self._pop_cv is None:
+            return
+        for y0, y1, _i in self._geom:
+            if y0 <= e.y < y1:
+                w = self._pop_w
+                self._pop_cv.coords(self._hl, self.PAD + 4, y0 + 1,
+                                    w - self.PAD - 4, y1 - 1)
+                self._pop_cv.itemconfigure(self._hl, state="normal")
+                self._pop_cv.tag_lower(self._hl, "row")
+                return
+        self._pop_cv.itemconfigure(self._hl, state="hidden")
+
+    def _on_click(self, e) -> None:
+        i = self._index_at(e.y)
+        if i >= 0:
+            self._pick(self._values[i])
+
+    def _on_wheel(self, e) -> None:
+        if self._pop is None:
+            return
+        if sum(self._row_h) + self.PAD * 2 <= self._pop_h + 1:
+            return                      # 全都塞得下，不用滚
+        step = -1 if e.delta > 0 else 1
+        self._scroll = max(0, min(len(self._values) - 1,
+                                  self._scroll + step))
+        self._layout()
+        if self._pop_cv is not None:
+            self._pop_cv.itemconfigure(self._hl, state="hidden")
+
+    def _maybe_close(self, _e=None) -> None:
+        """点了主窗口其他地方就收起列表。"""
+        if self._pop is None:
+            return
+        try:
+            px, py = self._pop.winfo_rootx(), self._pop.winfo_rooty()
+            pw, ph = self._pop.winfo_width(), self._pop.winfo_height()
+            wx = self.winfo_pointerx()
+            wy = self.winfo_pointery()
+            inside = (px <= wx <= px + pw) and (py <= wy <= py + ph)
+            mine = (self.winfo_rootx() <= wx <= self.winfo_rootx() + self._cw
+                    and self.winfo_rooty() <= wy
+                    <= self.winfo_rooty() + self._ch)
+            if not inside and not mine:
+                self._close()
+        except Exception:
+            pass
+
+    def _pick(self, value: str) -> None:
+        self.var.set(value)
+        self._close()
+        if self._on_select:
+            self._on_select()
+
+    def _close(self) -> None:
+        pop = self._pop
+        self._pop = None
+        self._pop_cv = None
+        self._scroll = 0
+        self._geom = []
+        try:
+            self.winfo_toplevel().unbind_all("<Button-1>")
+        except Exception:
+            pass
+        if pop is not None:
+            try:
+                pop.destroy()
+            except Exception:
+                pass
+
+    # ---------------------------------------------------------------- 接口
     def get(self) -> str:
         return self.var.get()
 
@@ -1235,21 +1506,29 @@ class RoundCombo(tk.Frame):
         self.var.set(value)
 
     def set_values(self, values: list[str]) -> None:
-        self._values = list(values)
-        self.combo["values"] = self._values
+        self._values = [str(v) for v in values]
+        if self._pop is not None:
+            self._close()
+        self._draw()
 
     def bind_select(self, func) -> None:
-        self.combo.bind("<<ComboboxSelected>>", lambda _e: func())
+        self._on_select = func
 
-    # 兼容 ttk.Combobox 的字典式访问（cb["values"] = [...]）
+    def destroy(self):
+        self._close()
+        super().destroy()
+
+    # 兼容字典式访问（cb["values"] = [...]）
     def __setitem__(self, key, value):
         if key == "values":
             self.set_values(list(value))
         else:
-            self.combo[key] = value
+            super().__setitem__(key, value)
 
     def __getitem__(self, key):
-        return self.combo[key]
+        if key == "values":
+            return self._values
+        return super().__getitem__(key)
 
 
 class ToggleRow(tk.Frame):
