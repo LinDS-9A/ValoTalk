@@ -54,8 +54,10 @@ with config_guard():
     print(f"  _frameless = {app._frameless}  style = {st:#010x}")
     check("标记为无边框", app._frameless is True)
     check("WS_CAPTION 没了", not (st & winapi.WS_CAPTION))
-    check("WS_THICKFRAME 还在（能拖边框）",
-          bool(st & winapi.WS_THICKFRAME), f"{st:#x}")
+    # WS_THICKFRAME 会画一圈 7px 深色系统边框（浅色界面上就是顶上那根黑线），
+    # 所以现在故意摘掉，改成 _bind_resize_edges() 自绘边缘拖拽
+    check("WS_THICKFRAME 已摘（改用自绘拖拽）",
+          not (st & winapi.WS_THICKFRAME), f"{st:#x}")
     check("WS_SYSMENU 还在（Alt+F4）",
           bool(st & winapi.WS_SYSMENU), f"{st:#x}")
 

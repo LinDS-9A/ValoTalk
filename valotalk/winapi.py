@@ -742,12 +742,16 @@ class _MONITORINFO(ctypes.Structure):
                 ("dwFlags", ctypes.c_ulong)]
 
 
-def strip_caption(hwnd: int) -> bool:
+def strip_caption(hwnd: int, remove_resize: bool = False) -> bool:
     """去掉系统标题栏，让客户区顶到窗口最上沿。
 
     只动 WS_CAPTION，保留 WS_THICKFRAME（边缘拖拽 + 贴边吸附）、
     WS_SYSMENU（Alt+F4 / 系统菜单）和最小/最大化位。
     去掉后系统的最小化/还原/关闭按钮会消失，需要自己画。
+
+    remove_resize=True 时连 WS_THICKFRAME 一起去掉 —— 那个样式会在窗口
+    四周画一圈 7px 的系统边框（实测 RGB≈#2B2B2B），在浅色界面上就是
+    用户看到的「黑线」。代价是失去边缘拖拽调整大小，只能靠最大化/还原。
     """
     try:
         user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
@@ -763,9 +767,12 @@ def strip_caption(hwnd: int) -> bool:
         style = user32.GetWindowLongW(wintypes.HWND(hwnd), GWLP_STYLE)
         if not style:
             return False
+        new_style = style & ~WS_CAPTION
+        if remove_resize:
+            new_style &= ~WS_THICKFRAME
         # 先改样式（这一步成功了才算数）
         user32.SetWindowLongW(wintypes.HWND(hwnd), GWLP_STYLE,
-                              ctypes.c_long(style & ~WS_CAPTION))
+                              ctypes.c_long(new_style))
         # 再让系统重算边框。这一步失败也无所谓 —— 样式已经改掉了，
         # 窗口下次重绘时会自己收敛，不能因为它抛异常就报「没成功」。
         try:
@@ -776,6 +783,32 @@ def strip_caption(hwnd: int) -> bool:
         except Exception:
             pass
         return True
+    except Exception:
+        return False
+
+
+def set_border_color(hwnd: int, color: str) -> bool:
+    """把窗口顶部那条系统边框染成指定色（Windows 11）。
+
+    实测（Win11 24H2）：这个属性只管**顶部**边框，左右下三边是
+    WS_THICKFRAME 画的，得靠 strip_caption(remove_resize=True) 去掉。
+
+    color 用 #RRGGBB；DWM 要的是 COLORREF(0x00BBGGRR)，所以这里倒一下。
+    """
+    try:
+        dwm = ctypes.WinDLL("dwmapi")
+        DWMWA_BORDER_COLOR = 34
+        c = color.lstrip("#")
+        if len(c) != 6:
+            return False
+        r = int(c[0:2], 16)
+        g = int(c[2:4], 16)
+        b = int(c[4:6], 16)
+        color_ref = (b << 16) | (g << 8) | r
+        val = ctypes.c_uint(color_ref)
+        res = dwm.DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR,
+                                        ctypes.byref(val), ctypes.sizeof(val))
+        return res == 0
     except Exception:
         return False
 
@@ -882,6 +915,27 @@ def round_window_region(hwnd: int, radius: int,
         ok = user32.SetWindowRgn(wintypes.HWND(hwnd), wintypes.HANDLE(rgn),
                                  True)
         return bool(ok)
+    except Exception:
+        return False
+
+
+def set_border_none(hwnd: int) -> bool:
+    """把窗口边框画成透明（Windows 11）。
+
+    去标题栏时保留了 WS_THICKFRAME（为了边缘能拖拽调整大小），
+    它会带一圈 1px 的系统边框 —— 在浅色界面上就是顶上那根「黑线」。
+    DWMWA_BORDER_COLOR 设成 DWMWA_COLOR_NONE 就不画了。
+
+    Win10 没有这个属性，返回 False，调用方忽略即可。
+    """
+    try:
+        dwm = ctypes.WinDLL("dwmapi")
+        DWMWA_BORDER_COLOR = 34
+        DWMWA_COLOR_NONE = 0xFFFFFFFE
+        val = ctypes.c_uint(DWMWA_COLOR_NONE)
+        r = dwm.DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR,
+                                      ctypes.byref(val), ctypes.sizeof(val))
+        return r == 0
     except Exception:
         return False
 

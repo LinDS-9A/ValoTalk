@@ -329,8 +329,8 @@ class App:
         # 只能用固定底色，玻璃太透的话每块 Label 都会浮出一个白方块。
         head = ui.GradientPane(outer, glass=True, radius=14,
                                layers=((ui.CARD, 0.72),),
-                               edge=0.10, highlight=0.16,
-                               blur=5.0, edge_color="#9A9AA6")
+                               edge=0.06, highlight=0.16,
+                               blur=5.0, edge_color="#B4B4BE")
         head.pack(fill="x", pady=(10, 8), padx=14)
 
         tk.Label(head, text="ValoTalk", bg=ui.HEAD_BG, fg=ui.TEXT,
@@ -866,13 +866,21 @@ class App:
             winapi.set_dark_titlebar(hwnd, True)
             # 去掉系统标题栏，让界面顶到窗口最上沿（head 那条栏接管标题栏职责）
             if self._get("ui.frameless", True):
-                if winapi.strip_caption(hwnd):
+                # remove_resize=True：连 WS_THICKFRAME 一起去掉。
+                # 那个样式会在窗口四周画一圈 7px 的深色系统边框
+                # （实测 RGB≈#2B2B2B），浅色界面上就是顶上那根黑线。
+                # 代价是失去系统级边缘拖拽，用 _bind_resize_edges() 补回来。
+                if winapi.strip_caption(hwnd, remove_resize=True):
                     self._frameless = True
                 winapi.keep_shadow(hwnd)      # 补回阴影和圆角
+                winapi.set_border_color(hwnd, ui.BG)   # 顶部残余边框染成底色
             # 大 R 角：DWM 的圆角改不了半径，只能自己裁窗口。
             # 窗口尺寸变了必须重裁，否则圆角会被拉伸成椭圆。
             self._round_hwnd = hwnd
             self._apply_win_radius()
+            # 摘掉 WS_THICKFRAME 后系统不再管边缘拖拽，自己补上
+            if self._frameless:
+                self._bind_resize_edges()
 
             def _resize_region(_e=None):
                 if _e is not None and getattr(_e, "widget", None) is not self.root:
@@ -911,6 +919,101 @@ class App:
             pass
 
     # ============================================================ 窗口控制
+    def _bind_resize_edges(self) -> None:
+        """自绘窗口的边缘拖拽调整大小。
+
+        为什么需要：去标题栏时连 WS_THICKFRAME 一起摘了（它会画那圈
+        7px 深色边框），系统的边缘 resize 就没了。这里在 root 上监听
+        鼠标，靠近边缘 6px 时换光标、按住拖动时改 geometry。
+
+        只处理四条边和四个角，中间区域交给各自的控件。
+        """
+        edge = 6
+        state = {"mode": None, "x": 0, "y": 0, "w": 0, "h": 0,
+                 "px": 0, "py": 0}
+
+        CURSORS = {
+            "l": "size_we", "r": "size_we", "t": "size_ns", "b": "size_ns",
+            "tl": "size_nw_se", "br": "size_nw_se",
+            "tr": "size_ne_sw", "bl": "size_ne_sw",
+            "": "arrow",
+        }
+
+        def _hit(e):
+            """判断鼠标在哪个边缘/角落上。"""
+            w = self.root.winfo_width()
+            h = self.root.winfo_height()
+            x, y = e.x, e.y
+            if x < 0 or y < 0 or x > w or y > h:
+                return ""
+            on_l = x <= edge
+            on_r = x >= w - edge
+            on_t = y <= edge
+            on_b = y >= h - edge
+            if on_t and on_l:
+                return "tl"
+            if on_t and on_r:
+                return "tr"
+            if on_b and on_l:
+                return "bl"
+            if on_b and on_r:
+                return "br"
+            if on_l:
+                return "l"
+            if on_r:
+                return "r"
+            if on_t:
+                return "t"
+            if on_b:
+                return "b"
+            return ""
+
+        def _motion(e):
+            mode = _hit(e)
+            try:
+                self.root.configure(cursor=CURSORS.get(mode, "arrow"))
+            except Exception:
+                pass
+            if state["mode"]:
+                # 正在拖边缘
+                dx = e.x_root - state["px"]
+                dy = e.y_root - state["py"]
+                x, y, w, h = state["x"], state["y"], state["w"], state["h"]
+                m = state["mode"]
+                min_w, min_h = 880, 660
+                if "l" in m:
+                    nw = max(min_w, w - dx)
+                    x = x + (w - nw)
+                    w = nw
+                if "r" in m:
+                    w = max(min_w, w + dx)
+                if "t" in m:
+                    nh = max(min_h, h - dy)
+                    y = y + (h - nh)
+                    h = nh
+                if "b" in m:
+                    h = max(min_h, h + dy)
+                self.root.geometry(f"{w}x{h}+{x}+{y}")
+                state.update(w=w, h=h, x=x, y=y,
+                             px=e.x_root, py=e.y_root)
+
+        def _press(e):
+            mode = _hit(e)
+            if not mode:
+                return
+            state.update(mode=mode,
+                         x=self.root.winfo_x(), y=self.root.winfo_y(),
+                         w=self.root.winfo_width(),
+                         h=self.root.winfo_height(),
+                         px=e.x_root, py=e.y_root)
+
+        def _release(_e=None):
+            state["mode"] = None
+
+        self.root.bind("<Motion>", _motion, add="+")
+        self.root.bind("<ButtonPress-1>", _press, add="+")
+        self.root.bind("<ButtonRelease-1>", _release, add="+")
+
     def _clear_aspect_busy(self) -> None:
         """4:3 锁定的防递归标记，隔一轮再放开。"""
         self._aspect_busy = False

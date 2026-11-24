@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import os as _os
 
-__version__ = "3.0.0-beta"
+__version__ = "3.0.0-beta2"
 
 # 老版本更新上来可能缺的文件（旧清单里没有）。
 # value = (仓库内相对路径, 降级实现)
