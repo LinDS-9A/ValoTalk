@@ -42,6 +42,56 @@ RED = "#E5484D"
 YELLOW = "#E8A600"
 ORANGE = "#E8760A"
 
+# ---------------- 渲染档位 ----------------
+# glass = 液态玻璃：裁剪背景 + 高斯模糊 + 多层合成 + 4x 超采样，
+#         好看但每块面板 10~15ms（低配机更久）
+# lite  = 简约：一律纯色圆角，不碰背景图、不模糊、不超采样。
+#         单块渲染降到 1ms 以内，低配机上最明显的就是页面切换和滚动
+#
+# 档位是全局的，必须在建控件之前设好；运行时切换要重画所有已存在的控件
+# （App._apply_render_mode 负责这件事）。
+_RENDER_MODE = "glass"
+
+
+def set_mode(mode: str) -> None:
+    """切档位。清缓存 —— 图片缓存里存的是按旧档位画好的东西。"""
+    global _RENDER_MODE
+    new = "lite" if str(mode or "").lower().startswith("lite") else "glass"
+    if new == _RENDER_MODE:
+        return
+    _RENDER_MODE = new
+    _img_cache.clear()
+    _eq_cache.clear()
+    _bg_scaled.clear()
+
+
+def is_lite() -> bool:
+    return _RENDER_MODE == "lite"
+
+
+def flat_layers_color(layers: tuple) -> str:
+    """把一组半透明叠层压成一个不透明色（以 BG 当底色）。
+
+    简约档用它替代「裁剪背景 + 叠层」：同一层玻璃在整块面板内是恒定色，
+    正好和里面 Label/Frame 的固定底色对得上，不会露出色差方块。
+    """
+    key = ("flatlayers", tuple((c, round(float(a), 3)) for c, a in layers))
+    hit = _eq_cache.get(key)
+    if hit is not None:
+        return hit
+    r, g, b = ImageColor.getrgb(BG)
+    r, g, b = float(r), float(g), float(b)
+    for color, alpha in layers:
+        cr, cg, cb = ImageColor.getrgb(color)
+        a = float(alpha)
+        r = r * (1 - a) + cr * a
+        g = g * (1 - a) + cg * a
+        b = b * (1 - a) + cb * a
+    out = "#%02X%02X%02X" % (int(round(r)), int(round(g)), int(round(b)))
+    _eq_cache[key] = out
+    return out
+
+
 FONT = "Microsoft YaHei UI"
 FS = 10                 # 正文字号
 FS_SMALL = 9
@@ -79,7 +129,18 @@ def round_image(w: int, h: int, radius: int, color: str,
     cached = _img_cache.get(key)
     if cached is not None:
         return cached
-    scale = 4                                   # 超采样再缩小，边缘更干净
+    # 直角 + 无描边：不需要抗锯齿，直接铺一块色。大面积容器（左右栏、
+    # 页面容器）都是 radius=0，走这条快路径能省掉整个超采样流程
+    if radius <= 0 and not outline:
+        img = Image.new("RGB", (w, h), ImageColor.getrgb(color))
+        photo = ImageTk.PhotoImage(img)
+        if len(_img_cache) > 400:
+            _img_cache.clear()
+        _img_cache[key] = photo
+        return photo
+    # 简约档只做 2x 超采样 + BILINEAR：圆角已经够顺滑，
+    # 没必要在低配机上为 4x + LANCZOS 多花几倍时间
+    scale = 2 if is_lite() else 4
     base = (ImageColor.getrgb(outside) + (255,)) if outside else (0, 0, 0, 0)
     img = Image.new("RGBA", (w * scale, h * scale), base)
     d = ImageDraw.Draw(img)
@@ -90,12 +151,27 @@ def round_image(w: int, h: int, radius: int, color: str,
         outline=outline,
         width=width * scale if outline else 0,
     )
-    img = img.resize((w, h), Image.LANCZOS)
+    img = img.resize((w, h), Image.BILINEAR if scale == 2 else Image.LANCZOS)
     photo = ImageTk.PhotoImage(img)
     if len(_img_cache) > 400:                   # 别无限涨
         _img_cache.clear()
     _img_cache[key] = photo
     return photo
+
+
+def round_points(x1: float, y1: float, x2: float, y2: float,
+                 r: float) -> list[float]:
+    """圆角矩形的多边形点集（配合 create_polygon(smooth=True)）。
+
+    简约档用矢量代替贴图：不用建 PIL 图、不用超采样、不用 resize，
+    窗口随便缩放也不掉帧。
+    """
+    r = max(0.0, min(float(r), (x2 - x1) / 2, (y2 - y1) / 2))
+    return [
+        x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
+        x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
+        x1, y2, x1, y2 - r, x1, y1 + r, x1, y1,
+    ]
 
 
 def toggle_image(w: int, h: int, on: bool, track: str, bg: str,
@@ -151,6 +227,11 @@ def glass_image(w: int, h: int, radius: int,
     """
     w, h = max(1, int(w)), max(1, int(h))
     radius = max(0, min(int(radius), min(w, h) // 2))
+    if is_lite():
+        # 简约档：不画渐变/高光/内阴影，一块纯色圆角就完事
+        base = fill or mid or top
+        return round_image(w, h, radius, base,
+                           outside=outside_color)
     key = ("glass", w, h, radius, top, bottom, edge, highlight,
            inner_shadow, mid, edge_pad, fill, outside_color)
     cached = _img_cache.get(key)
@@ -303,6 +384,8 @@ def card_inner_color(w: int, h: int, rx: int, ry: int,
     win_w, win_h = max(1, int(win_w)), max(1, int(win_h))
     cx = min(win_w - 1, max(0, int(rx) + w // 2))
     cy = min(win_h - 1, max(0, int(ry) + h // 2))
+    if is_lite():
+        return flat_layers_color(tuple(layers or CARD_LAYERS))
     try:
         # 取中心附近一小块求平均（模糊后本来就均匀，取平均更稳）
         half = max(2, min(12, w // 8, h // 8))
@@ -370,6 +453,17 @@ def bg_image(w: int, h: int, rx: int, ry: int,
     w, h = max(1, int(w)), max(1, int(h))
     win_w, win_h = max(1, int(win_w)), max(1, int(win_h))
     rx, ry = max(0, int(rx)), max(0, int(ry))
+    if is_lite():
+        # 简约档没有壁纸，整块就是底色
+        key0 = ("bgflat", w, h)
+        hit0 = _img_cache.get(key0)
+        if hit0 is not None:
+            return hit0
+        photo0 = ImageTk.PhotoImage(Image.new("RGB", (w, h), BG))
+        if len(_img_cache) > 400:
+            _img_cache.clear()
+        _img_cache[key0] = photo0
+        return photo0
     key = ("bgimg", w, h, rx, ry, win_w, win_h)
     cached = _img_cache.get(key)
     if cached is not None:
@@ -413,6 +507,9 @@ def glass_equivalent_color(rx: int, ry: int, w: int, h: int,
     win_w, win_h = max(1, int(win_w)), max(1, int(win_h))
     rx, ry = max(0, int(rx)), max(0, int(ry))
     lay_key = tuple((c, round(float(a), 4)) for c, a in layers)
+    if is_lite():
+        # 简约档整块是同一个色，不用按位置逐个算（省掉每控件的裁剪+缩放）
+        return flat_layers_color(tuple(layers))
     key = (rx, ry, w, h, win_w, win_h, lay_key)
     cached = _eq_cache.get(key)
     if cached is not None:
@@ -469,6 +566,12 @@ def glass_over_bg(w: int, h: int, rx: int, ry: int,
     win_w, win_h = max(1, int(win_w)), max(1, int(win_h))
     rx, ry = max(0, int(rx)), max(0, int(ry))
     radius = max(0, min(int(radius), min(w, h) // 2))
+    if is_lite():
+        # 简约档：跳过「裁剪背景 → 模糊 → 多层合成 → 超采样」，
+        # 直接给一块纯色圆角。这是省 CPU 的大头。
+        col = flat_layers_color(tuple(layers))
+        out_col = outside_color or BG
+        return round_image(w, h, radius, col, outside=out_col)
     lay_key = tuple((c, round(float(a), 4)) for c, a in layers)
     key = ("govb", w, h, rx, ry, win_w, win_h, radius, lay_key,
            edge, highlight, scale, keep_outside, edge_color, blur,

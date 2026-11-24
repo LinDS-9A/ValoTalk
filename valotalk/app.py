@@ -209,6 +209,8 @@ class App:
             port=int(self._get("remote.port", 8765) or 8765),
             token=str(self._get("remote.token", "") or ""),
         )
+        # 渲染档位必须在建控件之前定好：控件构造时就会按档位画图
+        ui.set_mode(str(self._get("ui.render_mode", "glass") or "glass"))
         self._build_ui()
         self._bind_hotkeys()
         # 注意：这几个必须在 _build_ui() 之后初始化 —— _build_ui 末尾会把
@@ -305,6 +307,10 @@ class App:
         self._bg_photo = None
 
         def _paint_bg(_e=None):
+            if ui.is_lite():
+                # 简约档没有壁纸，整窗一块底色就够，省掉每次改尺寸的缩放
+                self._bg_canvas.delete("bg")
+                return
             w = self.root.winfo_width()
             h = self.root.winfo_height()
             if w < 4 or h < 4:
@@ -1091,6 +1097,11 @@ class App:
         repaint_pending = {"v": False}
 
         def schedule_repaint():
+            # 简约档没有背景图要对齐，这套「滚动后全树重绘」纯属白烧 CPU；
+            # 而且 do() 里的 canvas.update_idletasks() 会被空闲任务反复唤醒，
+            # 在简约档下直接表现为滚轮一滚就卡死。整段跳过。
+            if ui.is_lite():
+                return
             # 滚动后 inner 物理位置变了，让整棵内容树按新位置重新裁剪背景，
             # 于是背景在视口上保持固定，只有卡片（内容）滚动，也不会露底色。
             # 防抖：连续滚轮事件只在几何稳定后重绘一次，避免逐控件闪烁/残影。
@@ -1100,6 +1111,8 @@ class App:
 
             def do():
                 repaint_pending["v"] = False
+                if ui.is_lite():
+                    return
                 try:
                     canvas.update_idletasks()
                     self._repaint_tree(inner)
@@ -1155,7 +1168,12 @@ class App:
 
         滚动 / 移动后控件位置变化，GradientPane 与 RoundCard 各自重新从
         原始背景图裁剪，背景在屏幕上保持固定，避免露底色或背景错位。
+
+        简约档里没有背景图要"对齐"，整棵树重绘纯属白花 CPU —— 尤其滚动时
+        每滚一下就要走一遍，低配机上就是卡顿的来源。直接跳过。
         """
+        if ui.is_lite():
+            return
         if isinstance(w, ui.GradientPane):
             try:
                 w._paint()
@@ -1420,6 +1438,44 @@ class App:
             tk.Label(row, text=v, bg=ui.CARD, fg=ui.TEXT3,
                      font=(ui.FONT, ui.FS_SMALL), anchor="w").pack(side="left")
 
+        # 分区：外观 / 更新线路
+        # 低配机上毛玻璃很吃 CPU（每块面板要裁剪背景 + 模糊 + 超采样），
+        # 这里给个一键降档；线路决定「检查更新」看哪一串 release
+        b4 = self._section(about_card.body, "外观与更新")
+        look_row = tk.Frame(b4, bg=ui.CARD)
+        look_row.pack(fill="x", pady=(2, 4))
+        tk.Label(look_row, text="界面外观", bg=ui.CARD, fg=ui.TEXT2,
+                 font=(ui.FONT, ui.FS_SMALL), width=8,
+                 anchor="w").pack(side="left")
+        self.cb_render = ui.RoundCombo(
+            look_row, ["毛玻璃（好看）", "简约（省资源）"],
+            width=150, height=28)
+        self.cb_render.pack(side="left", padx=(0, 8))
+        self.cb_render.set(
+            "简约（省资源）" if ui.is_lite() else "毛玻璃（好看）")
+        self.cb_render.bind_select(self._on_render_mode_change)
+        self._render_hint = tk.Label(
+            look_row, text="", bg=ui.CARD, fg=ui.TEXT3,
+            font=(ui.FONT, 8), anchor="w")
+        self._render_hint.pack(side="left")
+
+        ch_row = tk.Frame(b4, bg=ui.CARD)
+        ch_row.pack(fill="x", pady=(0, 4))
+        tk.Label(ch_row, text="更新线路", bg=ui.CARD, fg=ui.TEXT2,
+                 font=(ui.FONT, ui.FS_SMALL), width=8,
+                 anchor="w").pack(side="left")
+        self.cb_channel = ui.RoundCombo(
+            ch_row, ["正式版", "轻量版"], width=150, height=28)
+        self.cb_channel.pack(side="left", padx=(0, 8))
+        self.cb_channel.set(
+            "轻量版" if str(self._get("update.channel", "stable")) == "lite"
+            else "正式版")
+        self.cb_channel.bind_select(self._on_channel_change)
+        self._channel_hint = tk.Label(
+            ch_row, text="轻量版还没发布时会自动回落到正式版",
+            bg=ui.CARD, fg=ui.TEXT3, font=(ui.FONT, 8), anchor="w")
+        self._channel_hint.pack(side="left")
+
         # 分区：赞助（二维码 + 点击放大，扫不出来的话点一下就行）
         b3 = self._section(about_card.body, "赞助支持")
         sp_row = tk.Frame(b3, bg=ui.CARD)
@@ -1457,6 +1513,71 @@ class App:
                  anchor="w").pack(fill="x", pady=(1, 4))
         tk.Label(sp_txt, text="微信扫码 · 点图片可放大", bg=ui.CARD,
                  fg=ui.TEXT3, font=(ui.FONT, 8), anchor="w").pack(fill="x")
+
+    # ============================================================ 外观 / 线路
+    def _on_render_mode_change(self) -> None:
+        """切换界面外观。立即重画，不用重启。"""
+        want_lite = "简约" in self.cb_render.get()
+        mode = "lite" if want_lite else "glass"
+        self._set("ui.render_mode", mode)
+        try:
+            ui.set_mode(mode)
+            self._repaint_all()
+            self.log(f"[界面] 已切到{'简约' if want_lite else '毛玻璃'}外观")
+        except Exception as e:
+            self.log(f"[界面] 切换外观失败：{e}")
+        try:
+            if self._gamma_hint_alive():
+                self._render_hint.configure(
+                    text="已立即生效" if want_lite else "")
+        except Exception:
+            pass
+
+    def _gamma_hint_alive(self) -> bool:
+        try:
+            return bool(self._render_hint.winfo_exists())
+        except Exception:
+            return False
+
+    def _repaint_all(self) -> None:
+        """按当前档位把整棵界面重画一遍（切档位后调）。"""
+        def walk(w):
+            if isinstance(w, ui.GradientPane):
+                try:
+                    w._paint()
+                except Exception:
+                    pass
+            if isinstance(w, ui.RoundCard):
+                try:
+                    w._redraw()
+                    w.tint()
+                except Exception:
+                    pass
+            try:
+                if isinstance(w, ui.RoundButton):
+                    # RoundButton._draw 必须带颜色（normal / hover 两态）
+                    w._draw(w._fill)
+                elif isinstance(w, (ui.RoundCombo, ui.RoundEntry, ui.ToggleRow,
+                                    ui.WinButton)):
+                    w._draw()
+            except Exception:
+                pass
+            for c in w.winfo_children():
+                walk(c)
+
+        try:
+            walk(self.root)
+            # 窗口底色也按档位重来
+            self._bg_photo = None
+            self.root.event_generate("<Configure>")
+        except Exception:
+            pass
+
+    def _on_channel_change(self) -> None:
+        """切换更新线路：只影响「检查更新」看哪一串 release。"""
+        ch = "lite" if "轻量" in self.cb_channel.get() else "stable"
+        self._set("update.channel", ch)
+        self.log(f"[更新] 线路切到{'轻量版' if ch == 'lite' else '正式版'}")
 
     def _show_sponsor_big(self) -> None:
         """点赞助码弹原尺寸大图（小图在某些屏幕上扫不出来）。"""
@@ -2431,11 +2552,116 @@ class App:
             self.log(f"[手机] 复制失败：{e}")
 
     def _show_remote_qr(self) -> None:
-        """弹二维码 —— 总比让用户在手机上敲 IP 强。"""
+        """弹二维码 —— 总比让用户在手机上敲 IP 强。
+
+        ⚠️ 踩过坑：qrcode 不是标准库，早期没写进 requirements.txt，
+        有些环境（例如项目自带的 .venv）里根本没装。那时候这里只是
+        `log()` 一句 + 复制网址，用户看到的就是「点二维码没反应」。
+        现在改成：缺库就当场装，装不上再明确告诉用户，绝不静默吞掉。
+        """
         url = self.remote.url
         if not url:
             self.log("[手机] 还没启动，稍等一下")
             return
+        try:
+            import qrcode  # noqa: F401
+        except Exception:
+            self._install_qrcode_then_show(url)
+            return
+        self._draw_remote_qr(url)
+
+    # ---------------------------------------------------------------- 二维码
+    def _install_qrcode_then_show(self, url: str) -> None:
+        """缺 qrcode 时后台装一下，装好直接弹二维码。"""
+        tip = tk.Toplevel(self.root)
+        tip.title("手机遥控")
+        tip.configure(bg=ui.BG)
+        tip.resizable(False, False)
+        try:
+            tip.attributes("-topmost", True)
+        except Exception:
+            pass
+        box = tk.Frame(tip, bg=ui.BG)
+        box.pack(padx=26, pady=22)
+        msg = tk.Label(box, text="正在准备二维码组件…", bg=ui.BG, fg=ui.TEXT,
+                       font=(ui.FONT, 11))
+        msg.pack()
+        sub = tk.Label(box, text="第一次用需要装一个很小的包（qrcode）",
+                       bg=ui.BG, fg=ui.TEXT3, font=(ui.FONT, 8))
+        sub.pack(pady=(6, 0))
+        tip.update_idletasks()
+        try:
+            x = self.root.winfo_rootx() + (self.root.winfo_width()
+                                           - tip.winfo_width()) // 2
+            y = self.root.winfo_rooty() + (self.root.winfo_height()
+                                           - tip.winfo_height()) // 3
+            tip.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        except Exception:
+            pass
+        self.log("[手机] 缺 qrcode，正在自动安装…")
+
+        def work():
+            ok = False
+            err = ""
+            try:
+                import subprocess
+                import sys as _sys
+                flags = 0
+                if hasattr(subprocess, "CREATE_NO_WINDOW"):
+                    flags = subprocess.CREATE_NO_WINDOW
+                r = subprocess.run(
+                    [_sys.executable, "-m", "pip", "install", "-q",
+                     "qrcode[pil]"],
+                    capture_output=True, text=True, timeout=180,
+                    creationflags=flags)
+                ok = (r.returncode == 0)
+                if not ok:
+                    err = (r.stderr or r.stdout or "").strip()[-160:]
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+            if ok:
+                # pip 装完要让 import 系统重新扫一遍目录，否则还是找不到
+                try:
+                    import importlib
+                    importlib.invalidate_caches()
+                    import qrcode  # noqa: F401
+                except Exception as e:
+                    ok = False
+                    err = f"装完仍无法导入：{e}"
+
+            def done():
+                try:
+                    tip.destroy()
+                except Exception:
+                    pass
+                if ok:
+                    self.log("[手机] qrcode 已装好")
+                    self._draw_remote_qr(url)
+                else:
+                    self.log(f"[手机] 自动安装失败：{err}")
+                    self._qr_failed(err)
+
+            self._uiq.put(done)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _qr_failed(self, err: str) -> None:
+        """装不上就明说，并把网址复制好。"""
+        self._copy_remote()
+        try:
+            from .update_ui import NoticeDialog
+            NoticeDialog(
+                self.root, "二维码组件没装上",
+                "生成二维码需要 qrcode 这个包，自动安装没成功。\n\n"
+                "手动装一次就行（在项目目录执行）：\n"
+                "    .venv\\Scripts\\python.exe -m pip install \"qrcode[pil]\"\n\n"
+                f"访问网址已经帮你复制好了，粘到手机浏览器也能用。\n\n"
+                f"错误信息：{err or '（无）'}",
+                kind="warn")
+        except Exception:
+            pass
+
+    def _draw_remote_qr(self, url: str) -> None:
         try:
             import qrcode
             from PIL import Image, ImageTk
@@ -2447,7 +2673,6 @@ class App:
         top = tk.Toplevel(self.root)
         top.title("手机遥控")
         top.configure(bg=ui.BG)
-        top.attributes("-topmost", True)
         top.resizable(False, False)
 
         qr = qrcode.QRCode(box_size=8, border=1,
@@ -2489,6 +2714,15 @@ class App:
         x = self.root.winfo_rootx() + (self.root.winfo_width() - w) // 2
         y = self.root.winfo_rooty() + (self.root.winfo_height() - h) // 3
         top.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        # 主窗口是 topmost，这里的 topmost 要放在内容加完、定位之后再设，
+        # 否则偶尔会被主窗口压到后面（用户看到的就是「点了没反应」）
+        try:
+            top.attributes("-topmost", True)
+            top.lift()
+            top.focus_force()
+        except Exception:
+            pass
+
 
     def _check_firewall(self) -> None:
         """没放行就提醒一句 —— 这是手机连不上最常见的原因。"""

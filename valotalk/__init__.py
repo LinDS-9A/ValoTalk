@@ -16,12 +16,12 @@ from __future__ import annotations
 
 import os as _os
 
-__version__ = "3.0.1-beta3"
+__version__ = "3.1.0"
 
 # 这一版是不是测试版（GitHub 上标为 Pre-release）。
 # 为什么要单独一个开关：版本号 3.0.1 里没有 beta 字样，界面靠版本号
 # 字符串判断「是不是测试版」会失灵。用这个标记统一控制徽章和提示。
-PRERELEASE = True
+PRERELEASE = False
 
 # 老版本更新上来可能缺的文件（旧清单里没有）。
 # value = (仓库内相对路径, 降级实现)

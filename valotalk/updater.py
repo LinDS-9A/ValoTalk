@@ -162,6 +162,18 @@ class Updater:
         self._cancel = threading.Event()
 
     # ---------- 检查 ----------
+    def channel(self) -> str:
+        """当前更新线路：stable / lite。
+
+        线路只是「看哪一串 release」，不改代码：轻量版是同一个仓库里
+        带 -lite 后缀的 tag，装完之后本地配置记得住自己的外观档位。
+        """
+        try:
+            v = str(self._get("update.channel", "stable") or "stable")
+        except Exception:
+            v = "stable"
+        return "lite" if v.lower().startswith("lite") else "stable"
+
     def check(self, timeout: float = 12.0) -> UpdateInfo | None:
         """有新版返回 UpdateInfo，已最新/失败返回 None。
 
@@ -222,6 +234,7 @@ class Updater:
                 data = json.loads(raw.decode("utf-8", "ignore"))
                 vs = [v.get("version", "") for v in data.get("versions", [])]
                 vs = [v for v in vs if v]
+                vs = self._in_channel(vs)
                 for v in vs:
                     if parse_version(v) > parse_version(best):
                         best = v
@@ -241,6 +254,23 @@ class Updater:
         if not best:
             return None
         return best, best_pre
+
+    def _in_channel(self, versions: list[str]) -> list[str]:
+        """按线路过滤版本号。
+
+        轻量版用 -lite 后缀的 tag。版本号比较那套（parse_version）认不出
+        -lite，3.1.0 和 3.1.0-lite 会算成同一个数，所以必须先按后缀
+        分流再比大小 —— 否则轻量线用户会漏更新、或者被「跨线升级」。
+
+        轻量线一个 tag 都没有时回落到正式线：宁可让他继续更新，
+        也别把人卡在一个永远显示「已是最新」的版本上。
+        """
+        ch = self.channel()
+        if ch == "lite":
+            picked = [v for v in versions if v.lower().endswith("-lite")]
+            return picked or [v for v in versions
+                              if not v.lower().endswith("-lite")]
+        return [v for v in versions if not v.lower().endswith("-lite")]
 
     def _latest_from_github(self, timeout: float) -> tuple[str, bool] | None:
         """从 GitHub Releases API 取最新非草稿版本的 (版本号, 是否预发布)。
@@ -266,6 +296,8 @@ class Updater:
             tag = str(it.get("tag_name") or "")
             v = tag[1:] if tag.startswith("v") else tag
             if not v or not parse_version(v):
+                continue
+            if not self._in_channel([v]):
                 continue
             if parse_version(v) > parse_version(best):
                 best = v
