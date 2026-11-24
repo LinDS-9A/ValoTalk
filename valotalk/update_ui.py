@@ -105,9 +105,23 @@ class UpdateDialog:
 
     # ---------------------------------------------------------------- UI
     def _is_beta(self) -> bool:
-        """远端版本是不是测试版（版本号带 beta / alpha / rc / pre）。"""
+        """这个更新是不是测试版。
+
+        优先用 updater 读到的远端标记（info.prerelease）—— 它去远端
+        __init__.py 看 PRERELEASE，版本号是纯数字（3.0.1）也能判断准。
+        拿不到标记时退回看版本号字符串。
+        """
         v = str(getattr(self.info, "version", "") or "").lower()
-        return any(k in v for k in ("beta", "alpha", "rc", "pre"))
+        if any(k in v for k in ("beta", "alpha", "rc", "pre")):
+            return True
+        pre = getattr(self.info, "prerelease", None)
+        if pre is not None:
+            return bool(pre)
+        try:
+            from . import PRERELEASE
+            return bool(PRERELEASE)
+        except Exception:
+            return False
 
     def _build(self) -> None:
         pad = 20

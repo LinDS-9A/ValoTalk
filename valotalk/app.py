@@ -23,7 +23,7 @@ from tkinter import ttk
 
 import numpy as np
 
-from . import __version__
+from . import PRERELEASE, __version__
 from . import capture, envcheck, remote, ui_theme as ui, updater, winapi
 from .asr import WhisperASR
 from .asr_cloud import CloudASR, fix_ja_terms
@@ -340,7 +340,8 @@ class App:
         self.ver_lbl.pack(side="left", padx=(6, 0), pady=(7, 0))
         # 测试版标记：标题旁边挂个小橙标，一眼能看出不是正式版
         self._beta_lbl = None
-        if "beta" in __version__.lower() or "rc" in __version__.lower():
+        # PRERELEASE 标记优先：3.0.1 这种纯数字版本号靠字符串判断不出来
+        if PRERELEASE or "beta" in __version__.lower() or "rc" in __version__.lower():
             self._beta_lbl = tk.Label(
                 head, text=" 测试版 ", bg=ui.ORANGE, fg="#FFFFFF",
                 font=(ui.FONT, 8, "bold"), cursor="hand2")
@@ -1348,7 +1349,8 @@ class App:
         tk.Label(title_row, text="ValoTalk", bg=ui.CARD, fg=ui.TEXT,
                  font=(ui.FONT, 16, "bold"), anchor="w").pack(side="left")
         # 测试版徽章：让人一眼知道装的不是正式版
-        if "beta" in __version__.lower() or "rc" in __version__.lower():
+        # PRERELEASE 标记优先：3.0.1 这种纯数字版本号靠字符串判断不出来
+        if PRERELEASE or "beta" in __version__.lower() or "rc" in __version__.lower():
             tk.Label(title_row, text=" 测试版 ", bg=ui.ORANGE, fg="#FFFFFF",
                      font=(ui.FONT, 8, "bold")).pack(side="left", padx=(8, 0))
         tk.Label(b, text=f"v{__version__} · 无畏契约实时语音/聊天翻译",
@@ -1449,10 +1451,10 @@ class App:
 
         sp_txt = tk.Frame(sp_row, bg=ui.CARD)
         sp_txt.pack(side="left", fill="both", expand=True)
-        tk.Label(sp_txt, text="如果这个工具帮你赢了几局", bg=ui.CARD,
+        tk.Label(sp_txt, text="如果这个工具有帮到你", bg=ui.CARD,
                  fg=ui.TEXT2, font=(ui.FONT, ui.FS_SMALL),
                  anchor="w").pack(fill="x")
-        tk.Label(sp_txt, text="可以请我喝杯冰美式 ☕", bg=ui.CARD,
+        tk.Label(sp_txt, text="可以请我喝杯奶茶吗 🧋", bg=ui.CARD,
                  fg=ui.TEXT3, font=(ui.FONT, ui.FS_SMALL),
                  anchor="w").pack(fill="x", pady=(1, 4))
         tk.Label(sp_txt, text="微信扫码 · 点图片可放大", bg=ui.CARD,

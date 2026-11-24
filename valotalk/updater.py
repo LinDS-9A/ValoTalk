@@ -118,6 +118,9 @@ class UpdateInfo:
     version: str                       # '2.1.3'
     notes: str = ""                    # 更新说明（可能为空）
     files: list[str] = field(default_factory=list)
+    # 远端那一版是不是测试版。版本号可能是纯数字（3.0.1），
+    # 光看字符串判断不出来，所以 check() 会去读远端 __init__.py 的 PRERELEASE 标记。
+    prerelease: bool = False
 
     @property
     def tag(self) -> str:
@@ -175,7 +178,26 @@ class Updater:
             return None
         return UpdateInfo(version=remote,
                           notes=self._fetch_notes(remote),
-                          files=list(UPDATE_FILES))
+                          files=list(UPDATE_FILES),
+                          prerelease=self._fetch_prerelease(remote))
+
+    def _fetch_prerelease(self, version: str) -> bool:
+        """远端那一版是不是测试版。
+
+        版本号可能是纯数字（3.0.1 但 GitHub 上标的是 Pre-release），
+        光看字符串判断不出来，所以去读那个 tag 的 __init__.py，
+        看里面有没有 `PRERELEASE = True`。文件很小、走 CDN，代价可接受。
+        """
+        if any(k in version.lower() for k in ("beta", "alpha", "rc", "pre")):
+            return True
+        raw = _get(_tag_url(version, "valotalk/__init__.py"), timeout=8)
+        if not raw:
+            return False
+        try:
+            text = raw.decode("utf-8", "ignore")
+        except Exception:
+            return False
+        return re.search(r"^\s*PRERELEASE\s*=\s*True", text, re.M) is not None
 
     def _latest_version(self, timeout: float) -> str | None:
         """远端最新版本号。"""
