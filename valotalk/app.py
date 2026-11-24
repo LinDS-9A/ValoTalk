@@ -24,9 +24,10 @@ from tkinter import ttk
 import numpy as np
 
 from . import __version__
-from . import capture, remote, ui_theme as ui, updater, winapi
+from . import capture, envcheck, remote, ui_theme as ui, updater, winapi
 from .asr import WhisperASR
 from .asr_cloud import CloudASR, fix_ja_terms
+from .profiles import Profiles
 from .config import CONFIG
 from .ocr import ChatOCR, LineDiffer, is_player_chat
 from .overlay import Overlay
@@ -171,6 +172,18 @@ class App:
         self.post_q: queue.Queue[Job] = queue.Queue(maxsize=32)
         self._uiq: queue.Queue = queue.Queue()
 
+        # 模型配置库：先把老配置（translate.llm.* / asr.cloud_*）迁进来，
+        # 再让识别和翻译按选中的条目生效。
+        # ⚠ 必须放在 _uiq 之后 —— log() 要用它
+        self.profiles = Profiles(self._get, self._set)
+        if self.profiles.migrate():
+            self.log("[模型] 已把原有配置存成第一条模型配置")
+        # 老版本迁移可能留下重复项（地址 + 密钥都一样），顺手清掉
+        dropped = self.profiles.dedupe()
+        if dropped:
+            self.log(f"[模型] 清理了 {dropped} 条重复的模型配置")
+        self.profiles.apply_all(save=False)
+
         self._sources: dict[str, capture.AudioSource] = {}
         # 开关状态镜像：tkinter 变量只能在主线程读，工作线程一律读这里
         self.flags = {"team": True, "me": True, "chat": True}
@@ -198,6 +211,8 @@ class App:
         )
         self._build_ui()
         self._bind_hotkeys()
+        # 注意：这几个必须在 _build_ui() 之后初始化 —— _build_ui 末尾会把
+        # _frameless 设成 True（去掉标题栏成功时）。放到前面会被覆盖回 False。
 
         self.overlay = Overlay(self.root, self._get, self._set)
         if not self._get("overlay.click_through", True):
@@ -220,30 +235,118 @@ class App:
         self.root.after(300, self._autostart)
         self.root.after(4000, self._check_update_async)
         self.root.protocol("WM_DELETE_WINDOW", self.shutdown)
+        # 无标题栏状态由 _build_ui 末尾设置（strip_caption 成功才置 True），
+        # 这里不能写死 False，否则会把那边的结果覆盖掉。
 
     # ============================================================ UI
     def _build_ui(self) -> None:
         self.root = tk.Tk()
         self.root.title(f"ValoTalk v{__version__} · 无畏契约实时翻译")
-        self.root.geometry("980x720")
-        self.root.minsize(920, 660)
+        # 无标题栏相关状态：必须在方法开头就建好，后面各处会读
+        self._frameless = False        # 末尾 strip_caption 成功才置 True
+        self._is_maximized = False
+        self._restore_geo = ""
+        self._aspect_busy = False
+        self._last_region_size = None  # 上次裁圆角时的窗口尺寸
+        # 固定 4:3：初始 1024×768，最小 880×660；缩放时由 _lock_aspect 强制比例
+        # 高度取 768 是因为配置页卡片叠起来实测需要 ~660px 内容区，
+        # 720 高会溢出 30 多像素、底部 dock 被裁。
+        self.root.geometry("1024x768")
+        self.root.minsize(880, 660)
         self.root.configure(bg=ui.BG)
         ui.make_styles()
         if self._get("ui.panel_on_top", True):
             self.root.attributes("-topmost", True)
 
-        outer = tk.Frame(self.root, bg=ui.BG)
-        outer.pack(fill="both", expand=True, padx=14, pady=12)
+        # 4:3 宽高比锁定：判断用户主要在拉宽还是拉高，按变化更大的维度
+        # 修正另一个维度，保证 width:height 恒为 4:3
+        self._last_w, self._last_h = 960, 720
+
+        def _lock_aspect(_e=None) -> None:
+            # 绑定到 root 的 <Configure> 会收到所有子控件的事件（Tk 事件传播），
+            # 只处理窗口自身（widget 是 root）的那一次，其余直接忽略。
+            if _e is not None and getattr(_e, "widget", None) is not self.root:
+                return
+            # 最大化时不要锁比例：屏幕是 16:9，硬扳 4:3 会和 SetWindowPos
+            # 互相拉扯（Configure → geometry → Configure …），界面直接卡死
+            if getattr(self, "_is_maximized", False):
+                return
+            # 同一轮里被自己 geometry 触发的回调不再递归
+            if getattr(self, "_aspect_busy", False):
+                return
+            w = self.root.winfo_width()
+            h = self.root.winfo_height()
+            if w < 4 or h < 4:
+                return
+            if abs(w - self._last_w) >= abs(h - self._last_h):
+                want_h = int(round(w * 3 / 4))
+                if abs(h - want_h) > 1:
+                    self._aspect_busy = True
+                    try:
+                        self.root.geometry(f"{w}x{want_h}")
+                    finally:
+                        self.root.after(30, self._clear_aspect_busy)
+            else:
+                want_w = int(round(h * 4 / 3))
+                if abs(w - want_w) > 1:
+                    self._aspect_busy = True
+                    try:
+                        self.root.geometry(f"{want_w}x{h}")
+                    finally:
+                        self.root.after(30, self._clear_aspect_busy)
+            self._last_w, self._last_h = w, h
+
+        self.root.bind("<Configure>", _lock_aspect, add=True)
+
+        # 背景渐变：纯平底色显得死板，竖向渐变有纵深
+        self._bg_canvas = tk.Canvas(self.root, highlightthickness=0, bd=0,
+                                    bg=ui.BG)
+        self._bg_canvas.place(x=0, y=0, relwidth=1, relheight=1)
+        self._bg_photo = None
+
+        def _paint_bg(_e=None):
+            w = self.root.winfo_width()
+            h = self.root.winfo_height()
+            if w < 4 or h < 4:
+                return
+            ph = ui.bg_gradient(w, h)
+            self._bg_photo = ph
+            self._bg_canvas.delete("bg")
+            self._bg_canvas.create_image(0, 0, anchor="nw", image=ph, tags="bg")
+            self._bg_canvas.tag_lower("bg")
+
+        # add=True：不能替换掉前面 _lock_aspect 的绑定，否则 4:3 锁定会失效
+        self.root.bind("<Configure>", _paint_bg, add=True)
+        self.root.after(60, _paint_bg)
+
+        # 最底层就是壁纸本身：不叠任何玻璃色，让所有内容都「浮」在它上面。
+        # 之前用 glass=True 会给整窗盖一层灰，背景就全被压住了。
+        outer = ui.GradientPane(self.root, image=True, radius=ui.WIN_RADIUS)
+        outer.pack(fill="both", expand=True, padx=0, pady=0)
 
         # ---------------- 顶部一栏 ----------------
-        head = tk.Frame(outer, bg=ui.BG)
-        head.pack(fill="x", pady=(0, 10))
+        # 顶栏是悬浮玻璃。这里权重给到 0.72 —— 里面的 Label 不能透明、
+        # 只能用固定底色，玻璃太透的话每块 Label 都会浮出一个白方块。
+        head = ui.GradientPane(outer, glass=True, radius=14,
+                               layers=((ui.CARD, 0.72),),
+                               edge=0.10, highlight=0.16,
+                               blur=5.0, edge_color="#9A9AA6")
+        head.pack(fill="x", pady=(10, 8), padx=14)
 
-        tk.Label(head, text="ValoTalk", bg=ui.BG, fg=ui.TEXT,
+        tk.Label(head, text="ValoTalk", bg=ui.HEAD_BG, fg=ui.TEXT,
                  font=(ui.FONT, 18, "bold")).pack(side="left")
-        self.ver_lbl = tk.Label(head, text=f"v{__version__}", bg=ui.BG, fg=ui.TEXT3,
+        self.ver_lbl = tk.Label(head, text=f"v{__version__}", bg=ui.HEAD_BG, fg=ui.TEXT3,
                                 font=(ui.FONT, 9), cursor="hand2")
         self.ver_lbl.pack(side="left", padx=(6, 0), pady=(7, 0))
+        # 测试版标记：标题旁边挂个小橙标，一眼能看出不是正式版
+        self._beta_lbl = None
+        if "beta" in __version__.lower() or "rc" in __version__.lower():
+            self._beta_lbl = tk.Label(
+                head, text=" 测试版 ", bg=ui.ORANGE, fg="#FFFFFF",
+                font=(ui.FONT, 8, "bold"), cursor="hand2")
+            self._beta_lbl.pack(side="left", padx=(2, 0), pady=(7, 0))
+            self._beta_lbl.bind(
+                "<Button-1>", lambda _e: self._show_beta_notice())
         self.ver_lbl.bind("<Button-1>", lambda _e: self._manual_check_update())
         self.ver_lbl.bind("<Enter>", lambda _e: self.ver_lbl.configure(fg=ui.BLUE))
         self.ver_lbl.bind("<Leave>", lambda _e: self.ver_lbl.configure(fg=ui.TEXT3))
@@ -251,45 +354,151 @@ class App:
         # 手动检查更新（和启动时自动检查互不干扰）
         self.btn_update = ui.RoundButton(
             head, "检查更新", command=self._manual_check_update,
-            width=76, height=24, fill=ui.CARD2, bg=ui.BG, font_size=ui.FS_SMALL)
+            width=76, height=24, fill=ui.CARD2, bg=ui.HEAD_BG, font_size=ui.FS_SMALL)
         self.btn_update.pack(side="left", padx=(8, 0), pady=(3, 0))
 
-        self.state_lbl = tk.Label(head, text="● 未启动", bg=ui.BG, fg=ui.RED,
+        self.state_lbl = tk.Label(head, text="● 未启动", bg=ui.HEAD_BG, fg=ui.RED,
                                   font=(ui.FONT, 10, "bold"))
         self.state_lbl.pack(side="left", padx=(12, 0))
-        self.meter_lbl = tk.Label(head, text="", bg=ui.BG, fg=ui.TEXT2,
+        self.meter_lbl = tk.Label(head, text="", bg=ui.HEAD_BG, fg=ui.TEXT2,
                                   font=(ui.FONT, 9))
         self.meter_lbl.pack(side="left", padx=(8, 0))
 
+        # ---- 窗口按钮（去标题栏后系统按钮没了，自己画三个）----
+        # ⚠️ 必须最先 pack：pack(side="right") 是先创建的靠最右边缘，
+        # 放到后面创建会被「模型/停止/开始」推到左边去
+        self._win_btns = []
+        for name, tip, cmd in (
+            ("close", "关闭", self._on_close_click),
+            ("max", "最大化", self._toggle_maximize),
+            ("min", "最小化", self._minimize),
+        ):
+            b = ui.WinButton(head, name, command=cmd, bg=ui.HEAD_BG)
+            b.pack(side="right", padx=(2, 0), pady=(6, 0))
+            self._win_btns.append(b)
+        # pack 顺序是反的（先 pack 的在最右），列表顺序调回来方便后面取
+        self._win_btns.reverse()
+
         ui.RoundButton(head, "▶ 开始", command=self.start, width=86, height=32,
-                       fill=ui.BLUE, bold=True, bg=ui.BG).pack(side="right")
+                       fill=ui.BLUE, bold=True, bg=ui.HEAD_BG).pack(
+            side="right", padx=(10, 0))
         ui.RoundButton(head, "■ 停止", command=self.stop, width=74, height=32,
-                       fill=ui.CARD2, bg=ui.BG).pack(side="right", padx=(0, 8))
+                       fill=ui.CARD2, bg=ui.HEAD_BG).pack(side="right", padx=(0, 8))
         mc = ui.RoundCombo(head, ["tiny", "base", "small", "medium"], width=92,
-                           height=32, bg=ui.BG)
+                           height=32, bg=ui.HEAD_BG)
         mc.set(str(self._get("asr.model", "small")))
         mc.pack(side="right", padx=(0, 6))
         mc.bind_select(self._on_model_change)
         self.model_var = mc.var
         self.cb_model_ui = mc
-        tk.Label(head, text="模型", bg=ui.BG, fg=ui.TEXT2,
+        tk.Label(head, text="模型", bg=ui.HEAD_BG, fg=ui.TEXT2,
                  font=(ui.FONT, 9)).pack(side="right", padx=(12, 5))
 
-        # ---------------- 两列主体 ----------------
-        main = tk.Frame(outer, bg=ui.BG)
-        main.pack(fill="both", expand=True)
+        # ---- 拖动 & 双击最大化 ----
+        # 只绑在 head 本身和文字 Label 上；RoundButton/RoundCombo 是 Canvas，
+        # 事件到不了这里，不会误触发拖动
+        self._drag_off = None
+        self._drag_moved = False
 
-        left = tk.Frame(main, bg=ui.BG)
-        left.pack(side="left", fill="both", expand=True, padx=(0, 7))
-        right = tk.Frame(main, bg=ui.BG)
-        right.pack(side="left", fill="both", expand=True, padx=(7, 0))
+        def _drag_start(e):
+            if not getattr(self, "_frameless", False):
+                return
+            self._drag_off = (e.x_root - self.root.winfo_x(),
+                              e.y_root - self.root.winfo_y())
+            self._drag_moved = False
 
-        # ===== 左列：音频设备 =====
-        card = ui.RoundCard(left, pad=14)
-        card.pack(fill="x", pady=(0, 10))
-        body = card.body
-        tk.Label(body, text="音频设备", bg=ui.CARD, fg=ui.TEXT2,
-                 font=(ui.FONT, 9, "bold"), anchor="w").pack(fill="x", pady=(0, 8))
+        def _drag_move(e):
+            if not self._drag_off:
+                return
+            dx = e.x_root - self.root.winfo_x() - self._drag_off[0]
+            dy = e.y_root - self.root.winfo_y() - self._drag_off[1]
+            if abs(dx) + abs(dy) > 2:
+                self._drag_moved = True
+            self.root.geometry(
+                f"+{e.x_root - self._drag_off[0]}+{e.y_root - self._drag_off[1]}")
+
+        def _drag_end(_e):
+            self._drag_off = None
+
+        def _head_dblclick(_e):
+            if getattr(self, "_frameless", False):
+                self._toggle_maximize()
+
+        for w in (head,):
+            w.bind("<Button-1>", _drag_start)
+            w.bind("<B1-Motion>", _drag_move)
+            w.bind("<ButtonRelease-1>", _drag_end)
+            w.bind("<Double-Button-1>", _head_dblclick)
+
+        # head 里的纯文字 Label 也要能拖（它们是 Frame 子控件，不绑就点不动）
+        _head_children = list(head.winfo_children())
+
+        def _bind_drag(widgets):
+            for w in widgets:
+                cls = ""
+                try:
+                    cls = w.winfo_class()
+                except Exception:
+                    pass
+                if cls == "Label":
+                    w.bind("<Button-1>", _drag_start, add="+")
+                    w.bind("<B1-Motion>", _drag_move, add="+")
+                    w.bind("<ButtonRelease-1>", _drag_end, add="+")
+                    w.bind("<Double-Button-1>", _head_dblclick, add="+")
+
+        _bind_drag(_head_children)
+        self.root.after(200, lambda: _bind_drag(list(head.winfo_children())))
+
+                # ---------------- 主体：左半功能页 + 右半日志 ----------------
+        body = ui.GradientPane(outer, glass=True)
+        body.pack(fill="both", expand=True, padx=16, pady=0)
+
+        # 左半：页面 + 底部 dock
+        left_pane = ui.GradientPane(body, glass=True)
+        left_pane.pack(side="left", fill="both", expand=True, padx=(0, 7))
+        self.left_pane = left_pane
+
+        # 右半：运行日志（一直在这儿，不跟着页签切）
+        self.log_pane = ui.GradientPane(body, glass=True)
+        self.log_pane.pack(side="left", fill="both", expand=True, padx=(7, 0))
+
+        # dock 先 pack，占住左半的底部，页面再填上面
+        self._build_dock(left_pane)
+
+        # ---------------- 分页容器（左半里，内容超高时可滚）----------------
+        self.page_host, self.page_inner = self._scroll_host(left_pane)
+
+        # 主页：单列（日志已经挪到右边常驻了）
+        self.page_home = ui.GradientPane(self.page_inner, glass=True)
+        left = ui.GradientPane(self.page_home, glass=True)
+        left.pack(fill="both", expand=True)
+
+        # 配置页：单列（左半只有 ~470px，两列会把输入框挤爆）
+        self.page_cfg = ui.GradientPane(self.page_inner, glass=True)
+        cfg_col = ui.GradientPane(self.page_cfg, glass=True)
+        cfg_col.pack(fill="both", expand=True)
+        cfg_left = cfg_col
+        cfg_right = cfg_col
+
+        # 关于页（与主页/配置页一致，套一层中间 GradientPane 再放卡片）
+        self.page_about = ui.GradientPane(self.page_inner, glass=True)
+        about_wrap = ui.GradientPane(self.page_about, glass=True)
+        about_wrap.pack(fill="both", expand=True)
+        self._build_about_page(about_wrap)
+
+        self._show_page("home")
+        # 布局稳定后给所有卡片内部着色（营造内部渐变），再补一次防抖动
+        self.root.after(120, self._tint_all_cards)
+        self.root.after(600, self._tint_all_cards)
+
+        # ===== 主页：一个大玻璃卡片，内部用分隔线分区 =====
+        home_card = ui.RoundCard(left, pad=16)
+        home_card.pack(fill="both", expand=True)
+        # 权限告警显示/隐藏后要刷新整个卡片高度（perm_card 指向它）
+        card = home_card
+
+        # ===== 分区：音频设备 =====
+        body = self._section(home_card.body, "音频设备", first=True)
 
         self.cb_game = self._device_row(body, "游戏输出", "audio.game_output_device")
         self.cb_mic = self._device_row(body, "我的麦克风", "audio.mic_device")
@@ -306,10 +515,11 @@ class App:
         sc.pack(side="left")
         sc.bind_select(self._on_server_change)
         self.cb_server = sc
-        # 日服会切到大模型链路，标出来让用户知道音频会上传
-        self.asr_mode_lbl = tk.Label(row, text="", bg=ui.CARD, fg=ui.TEXT3,
+
+        # 识别/翻译通道提示：单独一行，塞在服务器下拉右边会被截断
+        self.asr_mode_lbl = tk.Label(body, text="", bg=ui.CARD, fg=ui.TEXT3,
                                      font=(ui.FONT, 8), anchor="w")
-        self.asr_mode_lbl.pack(side="left", padx=(6, 0))
+        self.asr_mode_lbl.pack(fill="x", pady=(4, 0))
 
         # 音色
         row2 = tk.Frame(body, bg=ui.CARD)
@@ -371,12 +581,8 @@ class App:
         self.perm_lbl.pack_forget()
         self.perm_row.pack_forget()
 
-        # ===== 左列：功能开关 =====
-        card2 = ui.RoundCard(left, pad=14)
-        card2.pack(fill="both", expand=True)
-        b2 = card2.body
-        tk.Label(b2, text="功能开关", bg=ui.CARD, fg=ui.TEXT2,
-                 font=(ui.FONT, 9, "bold"), anchor="w").pack(fill="x", pady=(0, 6))
+        # ===== 分区：功能开关（同一大卡片内，分隔线之上）=====
+        b2 = self._section(home_card.body, "功能开关")
 
         self.v_team = tk.BooleanVar(value=True)
         self.v_me = tk.BooleanVar(value=True)
@@ -385,7 +591,6 @@ class App:
         self.v_through = tk.BooleanVar(value=bool(self._get("overlay.click_through", True)))
         self.v_cpu = tk.BooleanVar(value=str(self._get("asr.device", "auto")) == "cpu")
         self.v_remote = tk.BooleanVar(value=bool(self._get("remote.enabled", False)))
-        self.v_big_asr = tk.BooleanVar(value=self._use_cloud_asr())
 
         for text, var, cb in [
             ("队友语音 → 中文字幕", self.v_team,
@@ -398,7 +603,6 @@ class App:
              lambda: self._set("overlay.show_original", self.v_orig.get())),
             ("字幕穿透鼠标", self.v_through, self._on_through_toggle),
             ("识别用 CPU（不抢显卡）", self.v_cpu, self._on_cpu_toggle),
-            ("大模型识别（更准）", self.v_big_asr, self._on_big_asr_toggle),
             ("手机遥控", self.v_remote, self._on_remote_toggle),
         ]:
             tr = ui.ToggleRow(b2, text, var, command=cb)
@@ -407,15 +611,6 @@ class App:
                 self.chk_me = tr
             elif var is self.v_remote:
                 self.chk_remote = tr
-            elif var is self.v_big_asr:
-                self.chk_big_asr = tr
-
-        # 大模型识别：显示当前服务商，没配 key 时提示
-        self.big_asr_lbl = tk.Label(
-            self.chk_big_asr.extra, text="", bg=ui.CARD, fg=ui.TEXT3,
-            font=(ui.FONT, 8), anchor="w")
-        self.big_asr_lbl.pack(side="left")
-        self.chk_big_asr.pack_extra()
 
         # 手机遥控的地址 + 二维码，塞在同一行的文字和开关之间
         self.remote_lbl = tk.Label(self.chk_remote.extra, text="未开启",
@@ -430,12 +625,20 @@ class App:
             self.btn_remote_qr.pack(side="left", padx=(6, 0))
         self.chk_remote.pack_extra()
 
-        # ===== 右列：快捷键 =====
-        card3 = ui.RoundCard(right, pad=14)
-        card3.pack(fill="x", pady=(0, 10))
-        b3 = card3.body
-        tk.Label(b3, text="快捷键（改完立刻生效）", bg=ui.CARD, fg=ui.TEXT2,
-                 font=(ui.FONT, 9, "bold"), anchor="w").pack(fill="x", pady=(0, 6))
+        # ---- 模型选择：语音识别 / LLM（配置在「配置」页的「模型配置」里加）----
+        tk.Frame(b2, bg=ui.CARD3, height=1).pack(fill="x", pady=(8, 5))
+        self.pick_ui: dict[str, dict] = {}
+        for kind, label in (("asr", "语音识别"), ("llm", "LLM")):
+            self.pick_ui[kind] = self._model_picker_row(b2, kind, label)
+
+        # 识别服务挪到「配置」页了（见下方 card_asr）
+
+        # ===== 配置页：一个大玻璃卡片，内部三个分区 =====
+        cfg_card = ui.RoundCard(cfg_left, pad=16)
+        cfg_card.pack(fill="both", expand=True)
+
+        # ===== 分区：快捷键 =====
+        b3 = self._section(cfg_card.body, "快捷键（改完立刻生效）", first=True)
 
         self.hk_vars: dict[str, tk.StringVar] = {}
         self.hk_combos: dict = {}
@@ -493,12 +696,64 @@ class App:
                                 font=(ui.FONT, 8))
         self.pos_lbl.pack(side="left", padx=(4, 0))
 
-        # ===== 右列：聊天区域 & 翻译 =====
-        card4 = ui.RoundCard(right, pad=14)
-        card4.pack(fill="x", pady=(0, 10))
-        b4 = card4.body
-        tk.Label(b4, text="聊天区域 & 翻译后端", bg=ui.CARD, fg=ui.TEXT2,
-                 font=(ui.FONT, 9, "bold"), anchor="w").pack(fill="x", pady=(0, 6))
+        # ===== 分区：模型配置（base_url + 密钥，识别和 LLM 共用）=====
+        ba = self._section(cfg_card.body, "模型配置")
+        tk.Label(ba, text="存一套地址 + 密钥，主页「语音识别」「LLM」里挑着用",
+                 bg=ui.CARD, fg=ui.TEXT3, font=(ui.FONT, 8),
+                 anchor="w", justify="left").pack(fill="x", pady=(0, 6))
+
+        # 已有配置列表（每条一行：名字 + 域名 + 删）
+        self.prof_list = tk.Frame(ba, bg=ui.CARD)
+        self.prof_list.pack(fill="x")
+
+        # 新增一行：名字 / 地址 / 密钥 / 添加
+        add1 = tk.Frame(ba, bg=ui.CARD)
+        add1.pack(fill="x", pady=(6, 0))
+        tk.Label(add1, text="名称", bg=ui.CARD, fg=ui.TEXT2,
+                 font=(ui.FONT, ui.FS_SMALL), width=4,
+                 anchor="w").pack(side="left")
+        self.e_prof_name = ui.RoundEntry(add1, width=86, height=28,
+                                         placeholder="自动起名")
+        self.e_prof_name.pack(side="left")
+        tk.Label(add1, text="地址", bg=ui.CARD, fg=ui.TEXT2,
+                 font=(ui.FONT, ui.FS_SMALL)).pack(side="left", padx=(6, 0))
+        # 地址给足宽度：https://maas.qianwenaiapi.com/compatible-mode/v1 很长
+        self.e_prof_url = ui.RoundEntry(
+            add1, width=234, height=28,
+            placeholder="https://api.deepseek.com/v1")
+        self.e_prof_url.pack(side="left", padx=(4, 0))
+
+        add2 = tk.Frame(ba, bg=ui.CARD)
+        add2.pack(fill="x", pady=(6, 0))
+        tk.Label(add2, text="密钥", bg=ui.CARD, fg=ui.TEXT2,
+                 font=(ui.FONT, ui.FS_SMALL), width=5,
+                 anchor="w").pack(side="left")
+        self.e_prof_key = ui.RoundEntry(add2, width=250, height=28, show="*",
+                                        placeholder="sk-xxxxxx")
+        self.e_prof_key.pack(side="left")
+        ui.RoundButton(add2, "添加", command=self._add_profile,
+                       width=56, height=28).pack(side="left", padx=(6, 0))
+
+        self.prof_hint = tk.Label(ba, text="", bg=ui.CARD, fg=ui.TEXT3,
+                                  font=(ui.FONT, 8), anchor="w",
+                                  justify="left", wraplength=400)
+        self.prof_hint.pack(fill="x", pady=(4, 0))
+
+        self._refresh_profile_list()
+
+        # 识别端点自检（保留「测一下」）
+        test_row = tk.Frame(ba, bg=ui.CARD)
+        test_row.pack(fill="x", pady=(6, 0))
+        self.asr_ep_lbl = tk.Label(test_row, text="", bg=ui.CARD, fg=ui.TEXT3,
+                                   font=(ui.FONT, 8), anchor="w",
+                                   justify="left", wraplength=316)
+        self.asr_ep_lbl.pack(side="left")
+        ui.RoundButton(test_row, "测一下", command=self._test_cloud_asr,
+                       width=56, height=26).pack(side="right")
+        self._refresh_asr_endpoint_label()
+
+        # ===== 分区：聊天区域 & 翻译后端 =====
+        b4 = self._section(cfg_card.body, "聊天区域 & 翻译后端")
 
         reg = tk.Frame(b4, bg=ui.CARD)
         reg.pack(fill="x")
@@ -578,25 +833,28 @@ class App:
         ui.RoundButton(llm_row2, "保存", command=self._save_llm,
                        width=56, height=28).pack(side="left", padx=(6, 0))
 
-        # ===== 右列：日志 =====
-        card5 = ui.RoundCard(right, pad=14)
+        # ===== 右半：日志（常驻，不随页签切换）=====
+        card5 = ui.RoundCard(self.log_pane, pad=12)
         card5.pack(fill="both", expand=True)
         b5 = card5.body
         tk.Label(b5, text="运行日志", bg=ui.CARD, fg=ui.TEXT2,
                  font=(ui.FONT, 9, "bold"), anchor="w").pack(fill="x", pady=(0, 6))
 
-        log_wrap = tk.Frame(b5, bg=ui.CARD2)
+        log_wrap = tk.Frame(b5, bg=ui.CARD, highlightthickness=0, bd=0)
         log_wrap.pack(fill="both", expand=True)
-        self.txt = tk.Text(log_wrap, height=6, bg=ui.CARD2, fg=ui.TEXT2,
-                           insertbackground=ui.TEXT, font=(ui.FONT, ui.FS_SMALL),
-                           relief="flat", bd=0, highlightthickness=0,
-                           wrap="word", padx=8, pady=6)
+        # 用 Canvas 自绘而不是 tk.Text：Text 的 bg 只能纯色，
+        # 会把卡片背后的壁纸挡成一块色板。GlassTextLog 把玻璃图和文字
+        # 画在同一个 Canvas 上，日志区域就是真透明的。
+        # 日志要长期阅读，比普通卡片多叠一点白（0.32 → 0.52）：
+        # 仍然能看到背后图案的轮廓和色调，但文字不会被深色区域吃掉。
+        self.txt = ui.GlassTextLog(
+            log_wrap, radius=0, layers=((ui.CARD, 0.52),),
+            font=(ui.FONT, ui.FS_SMALL), fg=ui.TEXT2, padding=8)
         self.txt.pack(side="left", fill="both", expand=True)
         sb = ttk.Scrollbar(log_wrap, command=self.txt.yview,
                            style="Vertical.TScrollbar")
         sb.pack(side="right", fill="y")
         self.txt.configure(yscrollcommand=sb.set)
-        self.txt.configure(state="disabled")
 
         self._refresh_devices(initial=True)
 
@@ -606,8 +864,560 @@ class App:
             hwnd = winapi.top_level_hwnd(self.root)
             winapi.set_rounded_window(hwnd, winapi.DWMWCP_ROUND)
             winapi.set_dark_titlebar(hwnd, True)
+            # 去掉系统标题栏，让界面顶到窗口最上沿（head 那条栏接管标题栏职责）
+            if self._get("ui.frameless", True):
+                if winapi.strip_caption(hwnd):
+                    self._frameless = True
+                winapi.keep_shadow(hwnd)      # 补回阴影和圆角
+            # 大 R 角：DWM 的圆角改不了半径，只能自己裁窗口。
+            # 窗口尺寸变了必须重裁，否则圆角会被拉伸成椭圆。
+            self._round_hwnd = hwnd
+            self._apply_win_radius()
+
+            def _resize_region(_e=None):
+                if _e is not None and getattr(_e, "widget", None) is not self.root:
+                    return
+                self.root.after_idle(self._apply_win_radius)
+
+            self.root.bind("<Configure>", _resize_region, add=True)
         except Exception:
             pass
+
+    def _apply_win_radius(self) -> None:
+        """按当前尺寸重裁窗口圆角（SetWindowRgn 不会跟着 resize）。
+
+        ⚠️ 必须按尺寸去重：SetWindowRgn 本身会触发 <Configure>，
+        不去重就是「裁 → Configure → 再裁 → …」死循环，窗口会被搞成
+        最小化坐标 (-32000,-32000)。
+        """
+        if not self._get("ui.win_radius", True):
+            return
+        try:
+            hwnd = getattr(self, "_round_hwnd", 0)
+            if not hwnd:
+                return
+            if getattr(self, "_is_maximized", False):
+                return
+            size = (self.root.winfo_width(), self.root.winfo_height())
+            if size[0] < 100 or size[1] < 100:
+                return
+            if size == getattr(self, "_last_region_size", None):
+                return                      # 尺寸没变，别重复裁
+            self._last_region_size = size
+            if not hasattr(self, "_dpi_scale"):
+                self._dpi_scale = self.root.winfo_fpixels("1i") / 96.0
+            winapi.round_window_region(hwnd, ui.WIN_RADIUS, self._dpi_scale)
+        except Exception:
+            pass
+
+    # ============================================================ 窗口控制
+    def _clear_aspect_busy(self) -> None:
+        """4:3 锁定的防递归标记，隔一轮再放开。"""
+        self._aspect_busy = False
+
+    def _minimize(self) -> None:
+        """最小化。去标题栏后系统按钮没了，走 Win32 而不是 tk 的 iconify，
+        因为 tk 的 iconify 在无标题栏窗口上偶尔会把窗口藏到桌面之外。"""
+        try:
+            hwnd = winapi.top_level_hwnd(self.root)
+            winapi.user32.ShowWindow(winapi.wintypes.HWND(hwnd), 6)  # SW_MINIMIZE
+        except Exception:
+            try:
+                self.root.iconify()
+            except Exception:
+                pass
+
+    def _toggle_maximize(self) -> None:
+        """最大化 / 还原。最大化时按「可用区域」算，别盖住任务栏。"""
+        try:
+            if self._is_maximized:
+                self.root.geometry(self._restore_geo or "960x720+120+80")
+                self._is_maximized = False
+                btns = getattr(self, "_win_btns", [])
+                if btns:
+                    btns[1]._kind = "max"
+                    btns[1]._draw()
+                # 还原后尺寸变了，清掉去重标记才会重新裁圆角
+                self._last_region_size = None
+                self.root.after(80, self._apply_win_radius)
+            else:
+                self._restore_geo = self.root.geometry()
+                # 最大化时撤掉圆角：贴满屏幕还带圆角会露背景，很难看
+                try:
+                    winapi.round_window_region(
+                        getattr(self, "_round_hwnd", 0), 0, 1.0)
+                except Exception:
+                    pass
+                hwnd = winapi.top_level_hwnd(self.root)
+                winapi.maximize_to_work_area(hwnd)
+                self._is_maximized = True
+                btns = getattr(self, "_win_btns", [])
+                if btns:
+                    btns[1]._kind = "restore"
+                    btns[1]._draw()
+        except Exception:
+            pass
+
+    def _on_close_click(self) -> None:
+        self.shutdown()
+
+    # ============================================================ 可滚动容器
+    def _scroll_host(self, parent):
+        """返回 (容器, 内容框)：内容比可视区高时竖着滚，不需要时滚动条自己藏起来。
+
+        为什么要滚：日志常驻占掉右半边之后，左半只剩 ~470px 宽，
+        配置页的卡片叠起来会超出窗口高度（实测 603px vs 可用 571px），
+        硬塞就是被裁掉一截。
+        """
+        # 内部填充容器用直角：圆角由外层 left_pane 承担。若自带圆角，
+        # 当 inner 内容没填满视口时，视口圆角外 keep_outside 的浅色背景
+        # 会在左下角露出一个三角破绽。
+        host = ui.GradientPane(parent, glass=True, radius=0)
+        host.pack(fill="both", expand=True)
+
+        canvas = ui.GradientPane(host, glass=True, radius=0)
+        inner = ui.GradientPane(canvas, glass=True)
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        # 细滚动条：内容比视口高时才出现。之前被整条去掉了，结果内容溢出
+        # 时既看不到「还有东西」也没法滚 —— 用户只看到底部被裁掉一截。
+        bar = ui.ThinScrollbar(host, command=canvas.yview)
+        canvas.configure(yscrollcommand=bar.set)
+
+        repaint_pending = {"v": False}
+
+        def schedule_repaint():
+            # 滚动后 inner 物理位置变了，让整棵内容树按新位置重新裁剪背景，
+            # 于是背景在视口上保持固定，只有卡片（内容）滚动，也不会露底色。
+            # 防抖：连续滚轮事件只在几何稳定后重绘一次，避免逐控件闪烁/残影。
+            if repaint_pending["v"]:
+                return
+            repaint_pending["v"] = True
+
+            def do():
+                repaint_pending["v"] = False
+                try:
+                    canvas.update_idletasks()
+                    self._repaint_tree(inner)
+                except Exception:
+                    pass
+            try:
+                self.root.after(1, do)
+            except Exception:
+                pass
+
+        def on_yview(first, last):
+            # 驱动滚动条滑块，同时让背景在视口固定（内容滚，背景不滚）
+            try:
+                bar.set(first, last)
+            except Exception:
+                pass
+            schedule_repaint()
+
+        canvas.configure(yscrollcommand=on_yview)
+        canvas.pack(side="left", fill="both", expand=True)
+
+        def sync(_e=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            # 内容溢出才显形；不需要时藏起来，别白占一条
+            try:
+                need = inner.winfo_reqheight() > canvas.winfo_height() + 2
+                if need and not bar.winfo_ismapped():
+                    bar.pack(side="right", fill="y", padx=(2, 0))
+                elif not need and bar.winfo_ismapped():
+                    bar.pack_forget()
+            except Exception:
+                pass
+
+        def on_canvas(_e):
+            canvas.itemconfig(win, width=max(1, canvas.winfo_width()))
+            sync()
+
+        def wheel(e):
+            if inner.winfo_reqheight() > canvas.winfo_height() + 2:
+                canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
+                schedule_repaint()
+
+        inner.bind("<Configure>", sync, add=True)
+        canvas.bind("<Configure>", on_canvas, add=True)
+        # 指针在左半里时接管滚轮；离开就还回去（别抢日志框的滚动）
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", wheel))
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+        self._page_canvas = canvas
+        return host, inner
+
+    def _repaint_tree(self, w) -> None:
+        """递归让容器按当前实际位置重新渲染含背景的玻璃图。
+
+        滚动 / 移动后控件位置变化，GradientPane 与 RoundCard 各自重新从
+        原始背景图裁剪，背景在屏幕上保持固定，避免露底色或背景错位。
+        """
+        if isinstance(w, ui.GradientPane):
+            try:
+                w._paint()
+            except Exception:
+                pass
+        if isinstance(w, ui.RoundCard):
+            try:
+                w._redraw()
+                w.tint()
+            except Exception:
+                pass
+        for c in w.winfo_children():
+            self._repaint_tree(c)
+
+    # ============================================================ 底部 dock
+    # 三个页签：主页 / 配置 / 关于。图标全用 Canvas 画（不依赖字体图标，
+    # 换台没有 emoji 字体的机器也不会变成方块）。
+    DOCK_ITEMS = (("home", "主页"), ("cfg", "配置"), ("about", "关于"))
+
+    def _build_dock(self, parent) -> None:
+        # wrap 只负责占住底部一行并居中 dock：用 image 模式显示原始背景、
+        # 不叠玻璃，避免它和圆角 dock 形成两层玻璃。
+        # wrap 必须和它所在的容器同色：用 image=True 会直接画壁纸原色，
+# 而 left_pane 是叠了灰玻璃的 —— 两者差一层，dock 左右就会露一条蓝带。
+        wrap = ui.GradientPane(parent, glass=True, radius=0,
+                               layers=ui.PANEL_LAYERS)
+        wrap.pack(side="bottom", fill="x", pady=(8, 4))
+        # 只放图标，不放文字 —— 高度压到 54，宽度按图标间距算
+        self._dock_w = 220
+        # dock 本身是一个圆角玻璃悬浮栏：明确的圆角胶囊外形 + 玻璃材质，
+        # 圆角外保留原始背景，像卡片一样浮在背景上。
+        self.dock = ui.GradientPane(wrap, glass=True, radius=24,
+                                    layers=((ui.CARD, 0.66),), edge=0.09,
+                                    blur=5.0, edge_color="#9A9AA6",
+                                    keep_outside=True,
+                                    outside_layers=ui.PANEL_LAYERS,
+                                    height=54, width=self._dock_w)
+        self.dock.pack(anchor="center")
+        self.dock.bind("<Button-1>", self._dock_click)
+        self.dock.bind("<Motion>", self._dock_motion)
+        self.dock.bind("<Leave>", lambda _e: self._dock_leave())
+        self._hover_key = ""
+        self._current_page = "home"
+        self._draw_dock()
+
+    @staticmethod
+    def _round_rect(cv: tk.Canvas, x1, y1, x2, y2, r, **kw):
+        """圆角矩形（用平滑多边形近似，Tk 没有原生圆角）。"""
+        pts = [
+            x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
+            x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
+            x1, y2, x1, y2 - r, x1, y1 + r, x1, y1,
+        ]
+        return cv.create_polygon(pts, smooth=True, **kw)
+
+    def _dock_geom(self):
+        """返回每个图标的中心 x（dock 宽度变了也能自适应）。"""
+        total = len(self.DOCK_ITEMS)
+        slot = self._dock_w / total
+        return [slot * (i + 0.5) for i in range(total)]
+
+    def _draw_dock(self, hover_key: str = "") -> None:
+        cv = self.dock
+        # 只清前景，保留 GradientPane 自身渲染的透明玻璃底（背景可见）
+        cv.delete("dockfg")
+        h = 54
+        w = self._dock_w
+
+        for (key, _label), cx in zip(self.DOCK_ITEMS, self._dock_geom()):
+            active = key == self._current_page
+            hover = key == hover_key
+            if active:
+                # 选中：浅蓝玻璃垫片（浅色主题下用淡蓝底 + 蓝图标）
+                ph2 = ui.glass_image(48, 40, 14, top="#D6E6FF",
+                                     bottom="#B9D4FF", edge=0.30,
+                                     highlight=0.34, inner_shadow=0.10)
+                cv.create_image(cx - 24, 7, anchor="nw", image=ph2,
+                                tags="dockfg")
+                self._dock_active_ph = ph2
+            elif hover:
+                self._round_rect(cv, cx - 24, 7, cx + 24, 47, 14,
+                                 fill="#E8E8EE", outline="", tags="dockfg")
+
+            fg = ui.BLUE if active else (ui.TEXT if hover else ui.TEXT3)
+            self._draw_icon(cv, key, cx, 26, fg, active, tag="dockfg")
+
+            # 底部小圆点：放在胶囊内下沿
+            if active:
+                cv.create_oval(cx - 2.5, 44, cx + 2.5, 49,
+                               fill=ui.BLUE, outline="", tags="dockfg")
+
+    def _draw_icon(self, cv: tk.Canvas, key: str, cx: float, cy: float,
+                   color: str, active: bool = False, tag: str = "") -> None:
+        """三个图标画出各自辨识度：房子 / 滑块 / 圆圈信息。不用外框套娃。"""
+        lw = 2.4 if active else 2.0
+        s = 11.5                                 # 统一尺寸基准（图标放大）
+
+        if key == "home":
+            # 房子：屋顶两笔 + 屋身 U 形 + 短门
+            cv.create_line(cx - s, cy - 1, cx, cy - s - 1,
+                           fill=color, width=lw, capstyle="round",
+                           joinstyle="round", tags=tag)
+            cv.create_line(cx, cy - s - 1, cx + s, cy - 1,
+                           fill=color, width=lw, capstyle="round",
+                           joinstyle="round", tags=tag)
+            cv.create_line(cx - s + 2.5, cy - 1.5,
+                           cx - s + 2.5, cy + s - 1,
+                           fill=color, width=lw, capstyle="round", tags=tag)
+            cv.create_line(cx + s - 2.5, cy - 1.5,
+                           cx + s - 2.5, cy + s - 1,
+                           fill=color, width=lw, capstyle="round", tags=tag)
+            cv.create_line(cx - s + 2.5, cy + s - 1,
+                           cx + s - 2.5, cy + s - 1,
+                           fill=color, width=lw, capstyle="round", tags=tag)
+            # 门
+            cv.create_line(cx - 2.5, cy + s - 1, cx - 2.5, cy + 2.5,
+                           fill=color, width=lw, capstyle="round", tags=tag)
+            cv.create_line(cx + 2.5, cy + s - 1, cx + 2.5, cy + 2.5,
+                           fill=color, width=lw, capstyle="round", tags=tag)
+            cv.create_line(cx - 2.5, cy + 2.5, cx + 2.5, cy + 2.5,
+                           fill=color, width=lw, capstyle="round", tags=tag)
+        elif key == "cfg":
+            # 滑块：三行「横线 + 圆点」，圆点错开位置
+            for i, (dy, kx) in enumerate(((-6.5, -3.5), (0, 3.5), (6.5, -1.5))):
+                cv.create_line(cx - s, cy + dy, cx + s, cy + dy,
+                               fill=color, width=lw, capstyle="round", tags=tag)
+                cv.create_oval(cx + kx - 3, cy + dy - 3,
+                               cx + kx + 3, cy + dy + 3,
+                               fill=ui.CARD, outline=color, width=1.8, tags=tag)
+        else:
+            # 圆圈 + i（信息比问号更清楚，也不像数字）
+            cv.create_oval(cx - s, cy - s, cx + s, cy + s,
+                           outline=color, width=lw, tags=tag)
+            cv.create_oval(cx - 1.1, cy - 5.4, cx + 1.1, cy - 3.2,
+                           fill=color, outline="", tags=tag)
+            cv.create_line(cx, cy - 1.2, cx, cy + 5,
+                           fill=color, width=lw, capstyle="round", tags=tag)
+
+    def _dock_hit(self, x: float) -> str:
+        for (key, _lbl), cx in zip(self.DOCK_ITEMS, self._dock_geom()):
+            if abs(x - cx) <= 26:
+                return key
+        return ""
+
+    def _dock_leave(self) -> None:
+        if getattr(self, "_hover_key", ""):
+            self._hover_key = ""
+            self._draw_dock("")
+
+    def _dock_motion(self, e) -> None:
+        key = self._dock_hit(e.x)
+        if key != getattr(self, "_hover_key", ""):
+            self._hover_key = key
+            self._draw_dock(key)
+        self.dock.configure(cursor="hand2" if key else "")
+
+    def _dock_click(self, e) -> None:
+        key = self._dock_hit(e.x)
+        if key:
+            self._show_page(key)
+
+    def _show_page(self, key: str) -> None:
+        """切页：藏掉其它两页，只 pack 当前页。"""
+        pages = {"home": self.page_home, "cfg": self.page_cfg, "about": self.page_about}
+        page = pages.get(key)
+        if page is None:
+            return
+        for k, p in pages.items():
+            if k != key:
+                p.pack_forget()
+        if not page.winfo_manager():
+            page.pack(fill="both", expand=True)
+        self._current_page = key
+        # 切页回到顶部，避免沿用上一页的滚动位置；再重绘让背景在视口固定
+        try:
+            self._page_canvas.yview_moveto(0)
+            self.root.after(2, lambda: self._repaint_tree(self._page_canvas))
+        except Exception:
+            pass
+        self._draw_dock(getattr(self, "_hover_key", ""))
+
+    # ============================================================ 关于页
+    def _build_about_page(self, parent) -> None:
+        # 关于页：一个大玻璃卡片，底部「快捷键速查」作内部分区
+        about_card = ui.RoundCard(parent, pad=16)
+        about_card.pack(fill="both", expand=True)
+        self._about_card = about_card
+        b = about_card.body
+        title_row = tk.Frame(b, bg=ui.CARD)
+        title_row.pack(fill="x")
+        tk.Label(title_row, text="ValoTalk", bg=ui.CARD, fg=ui.TEXT,
+                 font=(ui.FONT, 16, "bold"), anchor="w").pack(side="left")
+        # 测试版徽章：让人一眼知道装的不是正式版
+        if "beta" in __version__.lower() or "rc" in __version__.lower():
+            tk.Label(title_row, text=" 测试版 ", bg=ui.ORANGE, fg="#FFFFFF",
+                     font=(ui.FONT, 8, "bold")).pack(side="left", padx=(8, 0))
+        tk.Label(b, text=f"v{__version__} · 无畏契约实时语音/聊天翻译",
+                 bg=ui.CARD, fg=ui.TEXT2, font=(ui.FONT, ui.FS_SMALL),
+                 anchor="w").pack(fill="x", pady=(2, 8))
+
+        # 运行环境一行：Python 版本对不对，一眼能看到
+        env_row = tk.Frame(b, bg=ui.CARD)
+        env_row.pack(fill="x", pady=(0, 8))
+        state = envcheck.python_state()
+        py_desc = f"Python {envcheck.describe_python()}"
+        if state == "ok":
+            py_txt, py_fg = f"{py_desc} · 受支持（3.{envcheck.MIN_MINOR} ~ 3.{envcheck.MAX_MINOR}）", ui.TEXT3
+        else:
+            py_txt = f"{py_desc} · 不受支持！需要 3.{envcheck.MIN_MINOR} ~ 3.{envcheck.MAX_MINOR}"
+            py_fg = ui.ORANGE
+        tk.Label(env_row, text=py_txt, bg=ui.CARD, fg=py_fg,
+                 font=(ui.FONT, 8), anchor="w").pack(side="left")
+        ui.RoundButton(env_row, "查依赖", command=self._check_env_deps,
+                       width=66, height=24, font_size=8).pack(side="left", padx=(8, 0))
+
+        btn_row = tk.Frame(b, bg=ui.CARD)
+        btn_row.pack(fill="x", pady=(0, 8))
+        ui.RoundButton(btn_row, "检查更新", command=self._manual_check_update,
+                       width=88, height=30).pack(side="left")
+        ui.RoundButton(btn_row, "项目主页", command=self._open_github,
+                       width=88, height=30).pack(side="left", padx=(6, 0))
+        ui.RoundButton(btn_row, "打开配置页", command=lambda: self._show_page("cfg"),
+                       width=96, height=30).pack(side="left", padx=(6, 0))
+
+        note = (
+            "链路：队友语音 → 语音识别（本地/云端）→ 翻译 → 屏幕字幕；"
+            "我说中文 → 翻成目标语言 → TTS 进游戏麦克风。\n"
+            "本地识别（faster-whisper）不上传任何音频；"
+            "在主页把「语音识别」那一路启用后，音频才会发到你配置的服务。\n"
+            "热键在游戏有焦点时收不到（游戏输入独占），要用手机遥控那一路。"
+        )
+        # wraplength 跟着卡片宽度走，固定值会溢出（左列只有 ~410px）
+        self._about_note = tk.Label(
+            b, text=note, bg=ui.CARD, fg=ui.TEXT3, font=(ui.FONT, 8),
+            justify="left", anchor="w", wraplength=400)
+        self._about_note.pack(fill="x")
+
+        def _fit_note(_e=None):
+            try:
+                w = max(180, b.winfo_width() - 8)
+                self._about_note.configure(wraplength=w)
+            except Exception:
+                pass
+
+        # add=True：保留 RoundCard 的 _sync_height 与 GradientPane 的 _paint，
+        # 不能替换，否则卡片高度无法跟随内容、末尾分区会被裁切。
+        b.bind("<Configure>", _fit_note, add=True)
+
+        # 分区：快捷键速查（同一大卡片内）
+        b2 = self._section(about_card.body, "快捷键速查")
+        rows = [
+            ("按住（默认 F2）", "说中文 → 队友听到目标语言"),
+            ("F3", "字幕窗在「穿透鼠标 / 可拖动」之间切换"),
+            ("F4", "清空字幕"),
+            ("F5", "临时静音英文输出"),
+            ("手机遥控", "局域网网页，绕开游戏的输入独占"),
+        ]
+        for k, v in rows:
+            row = tk.Frame(b2, bg=ui.CARD)
+            row.pack(fill="x", pady=1)
+            tk.Label(row, text=k, bg=ui.CARD, fg=ui.TEXT2,
+                     font=(ui.FONT, ui.FS_SMALL), width=16, anchor="w").pack(side="left")
+            tk.Label(row, text=v, bg=ui.CARD, fg=ui.TEXT3,
+                     font=(ui.FONT, ui.FS_SMALL), anchor="w").pack(side="left")
+
+        # 分区：赞助（二维码 + 点击放大，扫不出来的话点一下就行）
+        b3 = self._section(about_card.body, "赞助支持")
+        sp_row = tk.Frame(b3, bg=ui.CARD)
+        sp_row.pack(fill="x", pady=(2, 4))
+
+        self._sponsor_img_small = None
+        self._sponsor_img_big = None
+        try:
+            from PIL import Image as _PILImage
+            from PIL import ImageTk as _PILTk
+            sp_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "assets", "sponsor.png")
+            if os.path.exists(sp_path):
+                src = _PILImage.open(sp_path).convert("RGB")
+                # 等比缩到高 148，显示够大能直接扫；点开是原尺寸
+                th = 148
+                tw = max(1, int(src.width * th / src.height))
+                self._sponsor_img_small = _PILTk.PhotoImage(
+                    src.resize((tw, th), _PILImage.LANCZOS))
+                self._sponsor_img_big = _PILTk.PhotoImage(src)
+                qr = tk.Label(sp_row, image=self._sponsor_img_small,
+                              bg=ui.CARD, bd=0, cursor="hand2")
+                qr.pack(side="left", padx=(0, 12))
+                qr.bind("<Button-1>", lambda _e: self._show_sponsor_big())
+        except Exception:
+            pass
+
+        sp_txt = tk.Frame(sp_row, bg=ui.CARD)
+        sp_txt.pack(side="left", fill="both", expand=True)
+        tk.Label(sp_txt, text="如果这个工具帮你赢了几局", bg=ui.CARD,
+                 fg=ui.TEXT2, font=(ui.FONT, ui.FS_SMALL),
+                 anchor="w").pack(fill="x")
+        tk.Label(sp_txt, text="可以请我喝杯冰美式 ☕", bg=ui.CARD,
+                 fg=ui.TEXT3, font=(ui.FONT, ui.FS_SMALL),
+                 anchor="w").pack(fill="x", pady=(1, 4))
+        tk.Label(sp_txt, text="微信扫码 · 点图片可放大", bg=ui.CARD,
+                 fg=ui.TEXT3, font=(ui.FONT, 8), anchor="w").pack(fill="x")
+
+    def _show_sponsor_big(self) -> None:
+        """点赞助码弹原尺寸大图（小图在某些屏幕上扫不出来）。"""
+        if not getattr(self, "_sponsor_img_big", None):
+            return
+        top = tk.Toplevel(self.root)
+        top.title("赞助支持 · 谢谢老板打赏")
+        top.configure(bg=ui.BG)
+        top.transient(self.root)
+        try:
+            top.attributes("-topmost", True)
+        except Exception:
+            pass
+        lbl = tk.Label(top, image=self._sponsor_img_big, bg="#FFFFFF", bd=0)
+        lbl.pack(padx=0, pady=0)
+        tk.Label(top, text="按 Esc 或点击图片关闭", bg=ui.BG, fg=ui.TEXT3,
+                 font=(ui.FONT, 8)).pack(pady=(0, 8))
+        top.bind("<Escape>", lambda _e: top.destroy())
+        lbl.bind("<Button-1>", lambda _e: top.destroy())
+        # 居中到主窗口
+        top.update_idletasks()
+        try:
+            x = self.root.winfo_rootx() + (self.root.winfo_width()
+                                           - top.winfo_width()) // 2
+            y = self.root.winfo_rooty() + (self.root.winfo_height()
+                                           - top.winfo_height()) // 2
+            top.geometry(f"+{max(0, x)}+{max(0, y)}")
+        except Exception:
+            pass
+        top.focus_force()
+
+    def _show_beta_notice(self) -> None:
+        """点「测试版」徽章时说明这是什么版本。"""
+        try:
+            from .update_ui import NoticeDialog
+            NoticeDialog(
+                self.root, "这是测试版",
+                f"当前版本 v{__version__} 是测试版，不是正式版。\n\n"
+                "· 界面和功能还在调整，可能有不稳定的地方\n"
+                "· 更新时会自动备份到 cache/update/backup/\n"
+                "· 遇到问题可以把「运行日志」里的内容发给我\n\n"
+                "想回到正式版：从 GitHub 的 Releases 页下载上一个正式版覆盖即可。",
+                kind="warn")
+        except Exception:
+            pass
+
+    def _open_github(self) -> None:
+        import webbrowser
+        webbrowser.open("https://github.com/LinDS-9A/ValoTalk")
+
+    def _check_env_deps(self) -> None:
+        """关于页的「查依赖」：缺哪个包、怎么补，直接说清楚。"""
+        def work():
+            missing = envcheck.missing_deps()
+            if not missing:
+                self.log("[环境] 依赖齐全，Python "
+                         f"{envcheck.describe_python()} 受支持")
+                return
+            self.log(f"[环境] 缺 {len(missing)} 个依赖：{'、'.join(missing)}")
+            self.log("       删掉 .venv 目录 → 双击 setup.ps1 重装（会自动挑 3.10~3.14 的 Python）")
+            st = envcheck.python_state()
+            if st != "ok":
+                self.log(f"       注意：当前 Python {envcheck.describe_python()} 不受支持，先换 3.13")
+        threading.Thread(target=work, daemon=True).start()
 
     def _device_row(self, parent, label: str, key: str):
         """一行设备选择：标签 + 圆角下拉。"""
@@ -782,23 +1592,25 @@ class App:
             self.log("已自动识别设备，可在上面手动改。")
 
     def _refresh_asr_mode_label(self, lang: str = "") -> None:
-        """把当前识别/翻译通道显示在服务器那一行。"""
+        """服务器那一行的小字：现在识别走什么、翻译走什么。"""
         lang = lang or str(self._get("asr.lang_teammates", "en") or "en")
         cloud = self._use_cloud_asr(lang)
+        # 翻译是 LLM 还是机翻，看 LLM 那一路有没有启用
+        llm_pick = self.profiles.llm_pick()
+        llm_on = bool(llm_pick.get("enabled", True)) and bool(
+            llm_pick.get("profile")) and bool(self._get(
+                "translate.llm.api_key", ""))
         ja = lang.startswith("ja")
+        trans = "LLM 翻译" if llm_on else (
+            "机翻（日服不准）" if ja else "机翻")
+
         if cloud:
-            # 显示具体服务商，让用户知道音频发到哪
             who = self.asr_cloud.describe() or "云端"
-            txt, color = f"☁ {who} + LLM 翻译", ui.BLUE
+            txt, color = f"☁ {who} + {trans}", ui.BLUE
             tip = "音频会上传到该服务"
-        elif not self.asr_cloud.available():
-            txt, color = "本地识别 · 没配 API key", ui.ORANGE
-            tip = ""
-        elif ja:
-            txt, color = "本地识别 + LLM 翻译", ui.TEXT3
-            tip = ""
         else:
-            txt, color = "本地识别", ui.TEXT3
+            # 没配 / 没启用 / 云端不可用 —— 都是走本地
+            txt, color = f"本地识别 + {trans}", ui.TEXT3
             tip = ""
         try:
             self.asr_mode_lbl.configure(text=txt, fg=color)
@@ -806,7 +1618,6 @@ class App:
             pass
         if tip:
             self.log(f"[识别] {txt}（{tip}）")
-        self._refresh_big_asr_label()
 
     def _on_server_change(self) -> None:
         label = self.cb_server.get()
@@ -904,6 +1715,8 @@ class App:
         self._set("translate.llm.model", self.e_model.get().strip())
         self._set("translate.llm.api_key", self.e_key.get().strip())
         self.log("LLM 配置已保存，正在自测 …")
+        # 识别默认跟着翻译那栏走，保存完把「识别服务」那行也刷一遍
+        self._refresh_asr_endpoint_label()
         threading.Thread(target=self._test_translate, daemon=True).start()
 
     def _test_translate(self) -> None:
@@ -1027,44 +1840,356 @@ class App:
                      f"（实测 6 核会丢 7 帧）；建议用「{ChatOCR.SPEED_CHOICES[safe]}」")
         self.log("[OCR] 引擎重建中，下一句聊天识别会稍慢")
 
-    # ============================================================ 大模型识别
-    def _on_big_asr_toggle(self) -> None:
-        """「大模型识别」开关：两个服务器都生效。"""
-        want = bool(self.v_big_asr.get())
-        if want and not self.asr_cloud.available():
-            # 没 key 就别让开关停在"开着但用不了"
-            self.v_big_asr.set(False)
-            self._set("asr.backend", "local")
-            self.log("[识别] 没配 LLM API key，无法使用大模型识别")
-            self.log("       在「聊天区域 & 翻译后端」里填 LLM 的 base_url / 模型 / 密钥")
-            self._refresh_big_asr_label()
-            self._refresh_asr_mode_label()
-            return
+    # ============================================================ 识别服务
+    _ASR_PROV_MAP = {
+        "跟随翻译": "",
+        "阿里云百炼": "dashscope",
+        "OpenAI 兼容": "openai",
+        "DeepSeek": "deepseek",
+    }
+    _ASR_PROV_BACK = {v: k for k, v in _ASR_PROV_MAP.items()}
 
-        self._set("asr.backend", "cloud" if want else "local")
-        if want:
-            self.log("[识别] 已切换到大模型识别（音频会发送到 "
-                     f"{self.asr_cloud.describe()}）")
-            threading.Thread(target=self._warm_cloud_asr, daemon=True).start()
-        else:
-            self.log("[识别] 已切换回本地识别（不上传音频）")
-        self._refresh_big_asr_label()
-        self._refresh_asr_mode_label()
-
-    def _refresh_big_asr_label(self) -> None:
-        """开关旁边显示当前服务商 / 提示。"""
+    def _refresh_asr_endpoint_label(self) -> None:
+        """小字：实际会打哪个地址、用哪个模型。"""
         def apply():
             try:
-                if not self.asr_cloud.available():
-                    self.big_asr_lbl.configure(text="未配 key", fg=ui.ORANGE)
-                elif self._use_cloud_asr():
-                    self.big_asr_lbl.configure(
-                        text=self.asr_cloud.describe(), fg=ui.BLUE)
+                c = self.asr_cloud
+                pick = self.profiles.asr_pick()
+                if not pick.get("enabled", True):
+                    txt, fg = "已停用 → 用本地 faster-whisper 识别", ui.TEXT3
+                elif not c.available():
+                    txt, fg = "没配密钥：先去上面「模型配置」加一条", ui.ORANGE
+                elif c.provider == "openai" and not c.model:
+                    txt = f"{c.base_url} → 没填模型名（要写 whisper-1 之类）"
+                    fg = ui.ORANGE
                 else:
-                    self.big_asr_lbl.configure(text="用本地 whisper", fg=ui.TEXT3)
+                    txt = f"{c.describe()} → {c.base_url}"
+                    fg = ui.TEXT3
+                self.asr_ep_lbl.configure(text=txt, fg=fg)
             except Exception:
                 pass
         self._uiq.put(apply)
+
+    def _test_cloud_asr(self) -> None:
+        if not self.asr_cloud.available():
+            self.log("[识别] 没配密钥，先在「翻译」那栏填密钥")
+            return
+        self.log(f"[识别] 测一下 {self.asr_cloud.describe()} …")
+
+        def work():
+            ok, msg = self.asr_cloud.probe()
+            self.log(("[识别] ✓ " if ok else "[识别] ✗ ") + msg)
+            if ok:
+                self.asr_cloud.warmed = True
+            self._refresh_asr_endpoint_label()
+        threading.Thread(target=work, daemon=True).start()
+
+    # ============================================================ 模型配置库（配置页）
+    def _refresh_profile_list(self) -> None:
+        """重画「模型配置」里的列表：每条一行，名字 + 域名 + 删。"""
+        try:
+            for w in self.prof_list.winfo_children():
+                w.destroy()
+        except Exception:
+            return
+
+        items = self.profiles.all()
+        if not items:
+            tk.Label(self.prof_list, text="还没有配置，在下面填一条",
+                     bg=ui.CARD, fg=ui.TEXT3, font=(ui.FONT, 8),
+                     anchor="w").pack(fill="x", pady=(0, 2))
+            self.prof_hint.configure(text="")
+            return
+
+        asr_name = str(self.profiles.asr_pick().get("profile", "") or "")
+        llm_name = str(self.profiles.llm_pick().get("profile", "") or "")
+
+        for it in items:
+            row = tk.Frame(self.prof_list, bg=ui.CARD2,
+                           highlightthickness=0, bd=0)
+            row.pack(fill="x", pady=(0, 4))
+
+            name = it["name"]
+            mark = ""
+            if name == asr_name and name == llm_name:
+                mark = "识别+LLM"
+            elif name == asr_name:
+                mark = "识别"
+            elif name == llm_name:
+                mark = "LLM"
+
+            tk.Label(row, text=name, bg=ui.CARD2, fg=ui.TEXT,
+                     font=(ui.FONT, 8, "bold"), width=11,
+                     anchor="w").pack(side="left", padx=(6, 0))
+
+            host = it["base_url"].replace("https://", "").replace("http://", "")
+            host = host.split("/")[0]
+            tk.Label(row, text=host or "（未填地址）", bg=ui.CARD2, fg=ui.TEXT3,
+                     font=(ui.FONT, 8), anchor="w").pack(side="left")
+
+            key_ok = "有 key" if it["api_key"] else "无 key"
+            tk.Label(row, text=key_ok, bg=ui.CARD2,
+                     fg=ui.GREEN if it["api_key"] else ui.ORANGE,
+                     font=(ui.FONT, 8)).pack(side="left", padx=(6, 0))
+
+            if mark:
+                tk.Label(row, text=mark, bg=ui.CARD2, fg=ui.BLUE,
+                         font=(ui.FONT, 8)).pack(side="left", padx=(6, 0))
+
+            ui.RoundButton(row, "删", width=32, height=20, font_size=8,
+                           command=lambda n=name: self._del_profile(n)
+                           ).pack(side="right", padx=(4, 4))
+
+        self.prof_hint.configure(
+            text=f"共 {len(items)} 条。删除正在用的那条会自动改指第一条。")
+        # 列表行是新加的，要按位置重新着色，否则卡片内部那一段还是死色
+        self.root.after_idle(self._tint_all_cards)
+
+    def _section(self, parent, title: str, first: bool = False):
+        """在大玻璃卡片 body 里开一个功能分区。
+
+        非首区先插一条固定分隔线（_keep_bg 让 tint 不改它的颜色），再放
+        分区小标题，返回装内容的普通 Frame。于是一页里所有功能共用一个
+        圆角玻璃框，只在内部用分隔线分区，不再是多个独立小卡片。
+        """
+        if not first:
+            sep = tk.Frame(parent, bg=ui.CARD3, height=1)
+            sep._keep_bg = True
+            sep.pack(fill="x", pady=(12, 10))
+        tk.Label(parent, text=title, bg=ui.CARD, fg=ui.TEXT2,
+                 font=(ui.FONT, 9, "bold"), anchor="w").pack(
+            fill="x", pady=(0, 8))
+        box = tk.Frame(parent, bg=ui.CARD)
+        box.pack(fill="x")
+        return box
+
+    def _tint_all_cards(self) -> None:
+        """把所有玻璃卡片里的子控件按位置重着色（内部渐变）。"""
+        def walk(w):
+            for c in w.winfo_children():
+                if isinstance(c, ui.RoundCard):
+                    try:
+                        c.tint()
+                    except Exception:
+                        pass
+                walk(c)
+        try:
+            walk(self.root)
+        except Exception:
+            pass
+
+    def _add_profile(self) -> None:
+        name = self.e_prof_name.get().strip()
+        url = self.e_prof_url.get().strip()
+        key = self.e_prof_key.get().strip()
+        if not url:
+            self.log("[模型] 地址不能为空（例 https://api.deepseek.com/v1）")
+            return
+        if not key:
+            self.log("[模型] 密钥不能为空")
+            return
+        if not url.startswith("http"):
+            url = "https://" + url
+
+        final = self.profiles.add(name, url, key)
+        self.e_prof_name.set("")
+        self.e_prof_url.set("")
+        self.e_prof_key.set("")
+
+        # 第一条自动两路都选上
+        if len(self.profiles.names()) == 1:
+            self._set("models.asr", {"profile": final,
+                                     "model": self._default_model_for(url, "asr"),
+                                     "enabled": True})
+            self._set("models.llm", {"profile": final,
+                                     "model": self._default_model_for(url, "llm"),
+                                     "enabled": True})
+            self.profiles.apply_all(save=False)
+            self.asr_cloud.close()
+
+        self._refresh_profile_list()
+        self._refresh_model_rows()
+        self.log(f"[模型] 已添加「{final}」：{url}")
+
+    def _del_profile(self, name: str) -> None:
+        if not self.profiles.remove(name):
+            return
+        self.profiles.apply_all(save=False)
+        self.asr_cloud.close()
+        self._refresh_profile_list()
+        self._refresh_model_rows()
+        self._refresh_asr_mode_label()
+        self.log(f"[模型] 已删除「{name}」")
+
+    # ============================================================ 模型选择
+    def _model_picker_row(self, parent, kind: str, label: str) -> dict:
+        """主页功能区的一行：配置下拉 + 模型输入框 + 启用按钮。
+
+        配置（base_url + api_key）在「配置」页的「模型配置」里添加，
+        这里只选哪一条、填模型名、开关它。
+        """
+        row = tk.Frame(parent, bg=ui.CARD)
+        row.pack(fill="x", pady=(0, 2))
+
+        tk.Label(row, text=label, bg=ui.CARD, fg=ui.TEXT,
+                 font=(ui.FONT, ui.FS_SMALL), width=6,
+                 anchor="w").pack(side="left")
+
+        names = self.profiles.names()
+        pick = (self.profiles.asr_pick() if kind == "asr"
+                else self.profiles.llm_pick())
+        cur = str(pick.get("profile", "") or "")
+
+        combo = ui.RoundCombo(row, names or ["未配置"], width=84, height=24)
+        combo.set(cur if cur in names else (names[0] if names else "未配置"))
+        combo.pack(side="left")
+
+        # 模型名给足宽度：qwen3-asr-flash 这种长名字别被截断
+        entry = ui.RoundEntry(row, width=126, height=24, placeholder="模型名")
+        entry.set(str(pick.get("model", "") or ""))
+        entry.pack(side="left", padx=(4, 0))
+        entry.entry.bind("<Return>", lambda _e: self._on_model_entered(kind))
+        entry.entry.bind("<FocusOut>", lambda _e: self._on_model_entered(kind))
+
+        btn = ui.RoundButton(row, "启用", width=46, height=24, font_size=8,
+                             command=lambda: self._toggle_model(kind))
+        btn.pack(side="left", padx=(4, 0))
+
+        ref = {"combo": combo, "entry": entry, "btn": btn,
+               "label": label, "kind": kind}
+        combo.bind_select(lambda: self._on_pick_profile(kind))
+        self._refresh_model_btn(kind, ref)
+        return ref
+
+    def _refresh_model_btn(self, kind: str, ref: dict | None = None) -> None:
+        """按钮文字/颜色跟当前启用状态走。"""
+        ref = ref or self.pick_ui.get(kind)
+        if not ref:
+            return
+        pick = (self.profiles.asr_pick() if kind == "asr"
+                else self.profiles.llm_pick())
+        on = bool(pick.get("enabled", True)) and bool(pick.get("profile"))
+        try:
+            ref["btn"].set_text("已启用" if on else "启用")
+            ref["btn"].set_fill(ui.GREEN if on else ui.BLUE)
+        except Exception:
+            pass
+
+    def _refresh_model_rows(self) -> None:
+        """配置库变了（增删改名）之后，把两行的下拉选项同步一次。"""
+        names = self.profiles.names()
+        for kind in ("asr", "llm"):
+            ref = self.pick_ui.get(kind)
+            if not ref:
+                continue
+            pick = (self.profiles.asr_pick() if kind == "asr"
+                    else self.profiles.llm_pick())
+            cur = str(pick.get("profile", "") or "")
+            try:
+                ref["combo"].set_values(names or ["未配置"])
+                ref["combo"].set(cur if cur in names
+                                 else (names[0] if names else "未配置"))
+                ref["entry"].set(str(pick.get("model", "") or ""))
+            except Exception:
+                pass
+            self._refresh_model_btn(kind, ref)
+
+    def _on_pick_profile(self, kind: str) -> None:
+        """换了一条配置：存下来，并把 model 换成该配置的默认模型名。"""
+        ref = self.pick_ui.get(kind)
+        if not ref:
+            return
+        name = ref["combo"].get()
+        if name == "未配置":
+            return
+        prof = self.profiles.get(name)
+        if not prof:
+            return
+        pick = dict(self.profiles.asr_pick() if kind == "asr"
+                    else self.profiles.llm_pick())
+        if pick.get("profile") != name:
+            pick["profile"] = name
+            default = self._default_model_for(prof["base_url"], kind)
+            pick["model"] = default
+            ref["entry"].set(default)
+        self._set(f"models.{kind}", pick)
+        self._apply_pick(kind)
+        self.log(f"[模型] {ref['label']} 换成「{name}」"
+                 f"（{prof['base_url'] or '未填地址'}）")
+
+    @staticmethod
+    def _default_model_for(base_url: str, kind: str) -> str:
+        """按服务商给个默认模型名。"""
+        low = (base_url or "").lower()
+        if kind == "asr":
+            if "deepseek" in low:
+                return ""              # DeepSeek 的 ASR 不需要模型名
+            if "dashscope" in low or "qianwen" in low or "aliyun" in low:
+                return "qwen3-asr-flash"
+            return "whisper-1"
+        if "deepseek" in low:
+            return "deepseek-flash"
+        if "dashscope" in low or "qianwen" in low or "aliyun" in low:
+            return "qwen-plus"
+        return "gpt-4o-mini"
+
+    def _on_model_entered(self, kind: str) -> None:
+        """模型名输入框失焦/回车时存下来。"""
+        ref = self.pick_ui.get(kind)
+        if not ref:
+            return
+        model = ref["entry"].get().strip()
+        pick = dict(self.profiles.asr_pick() if kind == "asr"
+                    else self.profiles.llm_pick())
+        if str(pick.get("model", "") or "") == model:
+            return
+        pick["model"] = model
+        self._set(f"models.{kind}", pick)
+        if pick.get("enabled", True) and pick.get("profile"):
+            self._apply_pick(kind)
+        self.log(f"[模型] {ref['label']} 模型名 → {model or '（空，用默认）'}")
+
+    def _toggle_model(self, kind: str) -> None:
+        """启用 / 停用这一路模型。"""
+        ref = self.pick_ui.get(kind)
+        if not ref:
+            return
+        pick = dict(self.profiles.asr_pick() if kind == "asr"
+                    else self.profiles.llm_pick())
+        name = str(pick.get("profile", "") or "")
+        if not name or not self.profiles.get(name):
+            self.log(f"[模型] {ref['label']} 还没选配置")
+            self.log("       先去「配置」页 →「模型配置」添加一条（地址 + 密钥）")
+            return
+
+        want = not bool(pick.get("enabled", True))
+        pick["enabled"] = want
+        model = ref["entry"].get().strip()
+        if model:
+            pick["model"] = model
+        self._set(f"models.{kind}", pick)
+        self._apply_pick(kind)
+        self._refresh_model_btn(kind, ref)
+
+        if want:
+            self.log(f"[模型] {ref['label']} 已启用：{name} / "
+                     f"{pick.get('model') or '默认模型'}")
+            if kind == "asr":
+                threading.Thread(target=self._warm_cloud_asr,
+                                 daemon=True).start()
+        else:
+            self.log(f"[模型] {ref['label']} 已停用"
+                     f"（{'改用本地识别' if kind == 'asr' else '改用机翻兜底'}）")
+
+    def _apply_pick(self, kind: str) -> None:
+        """把选中的配置同步到实际生效的配置项，并刷新界面标签。"""
+        if kind == "asr":
+            if self.profiles.apply_asr():
+                self.asr_cloud.close()      # 地址/密钥可能变了，连接要重建
+            self._refresh_asr_mode_label()
+        else:
+            self.profiles.apply_llm()
+            self._refresh_asr_mode_label()
 
     # ============================================================ 手机遥控
     def _on_remote_toggle(self) -> None:
@@ -1436,7 +2561,7 @@ class App:
     def _use_cloud_asr(self, lang: str = "") -> bool:
         """该不该用大模型（云端）识别。
 
-        面板上的「大模型识别」开关直接控制，两个服务器都生效：
+        主页「语音识别」那一行的启用按钮直接控制，两个服务器都生效：
           cloud → 用云端（前提是配了 key）
           local → 用本地
         兼容老配置：auto 视为 cloud（原来日服自动走云端）。
@@ -1847,10 +2972,7 @@ class App:
 
         def apply():
             try:
-                self.txt.configure(state="normal")
-                self.txt.insert("end", line + "\n")
-                self.txt.see("end")
-                self.txt.configure(state="disabled")
+                self.txt.append(line)
             except Exception:
                 pass
 
@@ -1868,6 +2990,10 @@ class App:
 
 
 def main() -> None:
+    # 先查 Python 版本：版本不对的话，后面 import 里那堆原生扩展会报
+    # "No matching distribution found" 一类的错，用户根本看不出是版本问题。
+    if not envcheck.check_or_exit():
+        raise SystemExit(2)
     App().run()
 
 

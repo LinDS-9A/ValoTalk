@@ -104,6 +104,11 @@ class UpdateDialog:
         self._center(master)
 
     # ---------------------------------------------------------------- UI
+    def _is_beta(self) -> bool:
+        """远端版本是不是测试版（版本号带 beta / alpha / rc / pre）。"""
+        v = str(getattr(self.info, "version", "") or "").lower()
+        return any(k in v for k in ("beta", "alpha", "rc", "pre"))
+
     def _build(self) -> None:
         pad = 20
         wrap = tk.Frame(self.top, bg=ui.BG)
@@ -118,9 +123,26 @@ class UpdateDialog:
         box.pack(side="left", padx=(10, 0))
         tk.Label(box, text="发现新版本", bg=ui.BG, fg=ui.TEXT,
                  font=(ui.FONT, 14, "bold"), anchor="w").pack(anchor="w")
-        tk.Label(box, text=f"v{__version__}  →  v{self.info.version}",
+        ver_row = tk.Frame(box, bg=ui.BG)
+        ver_row.pack(anchor="w")
+        tk.Label(ver_row, text=f"v{__version__}  →  v{self.info.version}",
                  bg=ui.BG, fg=ui.BLUE,
-                 font=(ui.FONT, ui.FS), anchor="w").pack(anchor="w")
+                 font=(ui.FONT, ui.FS), anchor="w").pack(side="left")
+
+        # 测试版徽章：老用户从正式版升上来时，得先知道这版是 beta
+        if self._is_beta():
+            badge = tk.Label(ver_row, text=" 测试版 ", bg=ui.ORANGE,
+                             fg="#FFFFFF", font=(ui.FONT, 8, "bold"))
+            badge.pack(side="left", padx=(8, 0))
+
+        if self._is_beta():
+            warn = tk.Label(
+                wrap,
+                text="⚠ 这是测试版：界面和功能还在调整，可能不稳定。\n"
+                     "  建议先备份当前版本（安装时会自动备份到 cache/update/backup/）。",
+                bg=ui.BG, fg=ui.ORANGE, font=(ui.FONT, ui.FS_SMALL),
+                justify="left", anchor="w", wraplength=430)
+            warn.pack(fill="x", pady=(10, 0))
 
         # 更新说明
         notes = (self.info.notes or "").strip()

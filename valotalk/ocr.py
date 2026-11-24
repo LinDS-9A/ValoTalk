@@ -227,10 +227,34 @@ class ChatOCR:
             self.last_error = f"OCR 失败: {exc}"
             return []
 
+    def _rapidocr_items(self, res) -> list:
+        """把两种 rapidocr 的返回格式统一成 [(box, text, score)]。
+
+        - `rapidocr_onnxruntime`（≤1.2，Python ≤3.12）：`(list[[box, text, score]], elapse)`
+        - `rapidocr` ≥3.0（Python 3.13 只能装这个）：`RapidOCROutput` 对象，
+          字段是**平行列表** `boxes / txts / scores`，且没识别到内容时全是 None
+          —— 直接迭代会报 `'RapidOCROutput' object is not iterable`。
+        """
+        if res is None:
+            return []
+        if hasattr(res, "boxes") and hasattr(res, "scores"):
+            # ⚠️ 这几个字段可能是 numpy.ndarray，`x or []` 会报
+            # "truth value of an array is ambiguous"，只能显式判 None
+            boxes = getattr(res, "boxes", None)
+            txts = getattr(res, "txts", None)
+            scores = getattr(res, "scores", None)
+            boxes = [] if boxes is None else list(boxes)
+            txts = [] if txts is None else list(txts)
+            scores = [] if scores is None else list(scores)
+            return list(zip(boxes, txts, scores))
+        if isinstance(res, tuple):
+            res = res[0]
+        return list(res) if res is not None else []
+
     def _read_rapidocr(self, img: np.ndarray, min_conf: float) -> list[str]:
         res = self._engine(img)
-        boxes = res[0] if isinstance(res, tuple) else res
-        if not boxes:
+        boxes = self._rapidocr_items(res)
+        if len(boxes) == 0:
             return []
         rows: list[tuple[float, float, str]] = []
         for item in boxes:

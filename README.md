@@ -30,6 +30,41 @@ powershell -ExecutionPolicy Bypass -File .\setup.ps1
 
 启动：**双击 `run.bat`**（会弹一次 UAC，点「是」—— 原因见 §3.7）。
 
+**推荐用 3.13 建个独立 venv**（`run.bat` 会优先用 `.venv`，不污染系统环境）：
+
+```powershell
+py -3.13 -m venv .venv
+.venv\Scripts\python.exe -m pip install -i https://mirrors.aliyun.com/pypi/simple -r requirements.txt
+.venv\Scripts\python.exe -m pip install nvidia-cublas-cu12 nvidia-cudnn-cu12   # 有 N 卡才装
+```
+
+**支持的 Python 版本：3.10 ~ 3.14**（`setup.ps1` 会自动挑，并自己建 `.venv`）。
+
+3.15 现在装不了：`ctranslate2` 有 cp315 轮子，但 `onnxruntime` 只出到 cp314，
+装到最后一步会整个失败，报的还是一句看不懂的 `No matching distribution found for onnxruntime`。
+
+**软件自己也会查这一点**：启动时先看 Python 版本，不在 3.10 ~ 3.14 就弹窗说清楚
+（当前版本、需要哪个版本、为什么、去哪下，还能一键打开下载页），不会让你对着一屏 pip 报错猜。
+「关于」页也会一直显示当前 Python 版本和「查依赖」按钮。
+
+调试时想无视这道闸（比如在 3.15 上硬试）：
+
+```powershell
+set VALOTALK_ALLOW_UNSUPPORTED_PY=1
+```
+
+两个装依赖时的坑（都是踩出来的）：
+
+- **Python 3.13 装不上 `rapidocr-onnxruntime`**（它 pin 了 `<3.13`，pip 报
+  `No matching distribution found`）。`requirements.txt` 已按版本分流：
+  3.12 及以下用 `rapidocr-onnxruntime`，3.13+ 用新版 `rapidocr`，代码两种都认
+  （升级的老用户什么都不用改，装的还是原来那个包）。
+- **新版 `rapidocr` 的返回值和旧版不一样**：旧的是 `(list, elapse)` 元组，
+  新的是 `RapidOCROutput` 对象（`boxes/txts/scores` 三个平行列表，且可能是
+  numpy 数组、没结果时是 `None`）。`ocr.py` 里已经统一成一种格式，
+  直接迭代或者 `x or []` 都会炸。
+- 没装 `nvidia-*` 也能跑，但会退回 CPU，识别慢 15 倍以上，基本没法实时用。
+
 ---
 
 ## 2. 游戏内设置（这一步不做，英文送不进游戏）
@@ -73,15 +108,32 @@ powershell -ExecutionPolicy Bypass -File .\setup.ps1
 
 ## 3. 用
 
-双击 `run.bat`，出现控制面板：
+双击 `run.bat`，出现控制面板。窗口分成左右两半：
+
+- **右半边固定是运行日志**，不跟着页签切换
+- **左半边是功能页**，底部居中是 dock，三个页签：
+
+| 页签 | 图标 | 放什么 |
+|---|---|---|
+| **主页** | 房子 | 音频设备、功能开关 |
+| **配置** | 文件 | 快捷键、字幕字号/位置、识别服务、聊天区域 & 翻译后端 |
+| **关于** | 圆圈问号 | 版本、Python 版本与依赖检查、项目主页、链路与隐私说明、快捷键速查 |
+
+图标是 Canvas 画的（不是字体图标），选中的变蓝并多一条小横杠。
+左半内容比窗口高时会出现竖向滚动条（窗口拉到 980×760 以上就不需要滚），
+鼠标在左半里滚轮就滚左半，不会抢日志框。
+
+主页面板从上到下：
 
 1. **设备**三行会自动识别好，不对就手动选：
    - 游戏输出（采队友语音）→ 你的耳机
    - 我的麦克风 → 你的真实麦克风
    - TTS 输出 → **扬声器 (VB-Audio Virtual Cable)**（默认名 `CABLE Input`）
 2. 点 **测试 TTS→游戏**，进游戏按一下语音键，能听见英文就通了。
-3. 点 **框选左下角聊天**，拖一个框把聊天框圈住（Esc 取消）。
+3. 点 **框选左下角聊天**（在「配置」页），拖一个框把聊天框圈住（Esc 取消）。
 4. 顶部 **▶ 开始**（启动时会自动开始一次）。
+
+> 顶栏（标题、版本、▶ 开始 / ■ 停止、模型下拉）不在页签里，切到哪一页都看得见。
 
 ### 快捷键（全局，游戏里也生效）
 
@@ -384,26 +436,32 @@ Bサイトにスパイク設置          → B点下包
 
 | 服务商 | `cloud_provider` | 端点 | 备注 |
 |---|---|---|---|
-| **DeepSeek** | `deepseek` | `POST {base}/tools/asr` | 官方已支持 ASR，可复用翻译的 key |
+| **跟着翻译那栏** | 留空 | 用 `translate.llm.base_url` | 默认行为，一套 key 走天下 |
 | **阿里云百炼** | `dashscope` | 原生多模态接口 | `qwen3-asr-flash` |
-| **OpenAI / 硅基流动 / 火山 / 自建** | `openai` | `POST {base}/audio/transcriptions` | 标准 OpenAI 兼容格式 |
+| **OpenAI / 硅基流动 / Groq / 火山 / 自建** | `openai` | `POST {base}/audio/transcriptions` | 标准 OpenAI 兼容格式 |
+| **DeepSeek** | `deepseek` | `POST {base}/tools/asr` | ⚠️ 官方 API Reference 里查不到这个端点，只有确认你的中转支持时才用 |
+
+**2026-11-23 之后：识别默认跟着翻译那栏走。** `asr.cloud_base_url` /
+`cloud_model` / `cloud_api_key` 留空时，识别直接复用 `translate.llm` 的同名字段 ——
+填过一次 LLM，识别就不用再配一遍。要单独用别家，才填 `asr.cloud_*` 覆盖。
 
 ```jsonc
-// 用 DeepSeek（识别+翻译一套 key）
-"asr": {
-  "cloud_provider": "deepseek",
-  "cloud_api_key": ""          // 留空则复用 translate.llm.api_key
+// ① 最省事：跟着翻译那栏（什么都不用填）
+"asr": { "backend": "cloud" },
+"translate.llm": {
+  "base_url": "https://api.siliconflow.cn/v1",
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "api_key": "sk-..."            // 识别沿用这把 key
 }
 
-// 用硅基流动的 SenseVoice
+// ② 识别单独用百炼（翻译仍走上面那家）
 "asr": {
-  "cloud_provider": "openai",
-  "cloud_base_url": "https://api.siliconflow.cn/v1",
-  "cloud_model": "FunAudioLLM/SenseVoiceSmall",
-  "cloud_api_key": "sk-..."
+  "cloud_provider": "dashscope",
+  "cloud_model": "qwen3-asr-flash",
+  "cloud_api_key": "sk-..."       // 百炼的 key，和翻译那把不同
 }
 
-// 用本机的 whisper-server
+// ③ 本机 whisper-server（音频不出本机，走 OpenAI 兼容协议）
 "asr": {
   "cloud_provider": "openai",
   "cloud_base_url": "http://127.0.0.1:8080/v1",
@@ -411,8 +469,31 @@ Bサイトにスパイク設置          → B点下包
 }
 ```
 
-`cloud_provider` 留空时会按 `cloud_base_url` 自动判断（含 `deepseek` → DeepSeek，
-含 `dashscope`/`qianwen` → 阿里云，其它 → OpenAI 兼容）。
+`cloud_provider` 留空时会按 **实际生效的 base_url**（识别专用优先，其次翻译那栏）
+自动判断：含 `deepseek` → DeepSeek，含 `dashscope`/`qianwen` → 阿里云，其它 → OpenAI 兼容。
+
+**面板上有个「识别服务」卡（配置页）**：
+
+- **服务**下拉：跟随翻译 / 阿里云百炼 / OpenAI 兼容 / DeepSeek
+- **地址 / 模型 / 密钥**三个框：**留空就跟随「翻译」那栏**，要单独用别家才填。
+  三项都清空 = 回到跟随模式；只填一项也行（比如只换地址不改 key）
+- **测一下**：真发 0.5 秒音频打一次接口，401/404 直接说人话：
+
+| 报错 | 面板上会写 |
+|---|---|
+| 401 / 403 | `xxx 拒绝了这把密钥（HTTP 401）：key 填错，或者这个 key 没开通语音识别` |
+| 404 | `xxx 没有这个识别接口（HTTP 404）：地址可能不是 OpenAI 兼容的 /v1，或者这家根本不提供语音识别` |
+| 401 + provider=deepseek | `DeepSeek 官方没有语音识别接口，密钥再对也没用 —— 识别请换阿里云百炼 / OpenAI 兼容的服务` |
+| 429 | `xxx 限流了（HTTP 429），等一会儿再试或换一家` |
+
+地址填了但和服务协议对不上时，日志会提醒一句（比如选了「阿里云百炼」却填了硅基流动的地址）。
+
+**模型名不会跟着翻译那栏走**：`deepseek-chat` / `qwen-plus` 是聊天模型，
+拿去请求 `/audio/transcriptions` 只会 400，所以 OpenAI 兼容那边默认 `whisper-1`。
+
+**按 key 认服务商的坑**：DeepSeek 的 key 只能做翻译，不能做识别。
+它的 API Reference 只有 chat completion，没有 `/audio/transcriptions`；
+把 ds 的 key 填进识别栏，返回的只会是 401（而不是 404），很容易误判成"key 填错了"。
 
 **隐私说明**：云端识别会把音频发到**你配置的那个服务**，不是固定某家。
 不想上传就把 `asr.backend` 设成 `local`，全部在本机识别。
@@ -927,15 +1008,16 @@ $py = "python"
 & $py -X utf8 tools\boot_test.py          # 真启动 40 秒，看模型和采集是否就绪
 & $py -X utf8 tools\capture_stability.py  # 采集稳定性（应 100%）
 & $py -X utf8 tools\uitest.py             # 字幕排版（存 cache/ui_shot.png）
-& $py -X utf8 tools\quality_test.py       # 音质对比：均值/左/右声道谁识别得准
 & $py -X utf8 tools\remote_test.py        # 手机遥控接口 + 掉线看门狗
 & $py -X utf8 tools\segmenter_race_test.py # 采集线程与手机线程并发 flush
 & $py -X utf8 tools\keyinject_probe.py    # 权限/完整性级别 + SendInput 是否被拦
 & $py -X utf8 tools\keyinject_elevated_probe.py  # 提权后注入能不能真的进去
-& E:\Node\node.exe tools\remote_page_logic.js  # 手机页面交互逻辑（按住/点按/心跳）
 ```
 
 `boot_test.py` 里 `采集源` 那行最有用：`running=True` + `peak` 会随声音跳动，说明麦克风和游戏音频都收进来了。
+
+> 开发期用过的 140 多个调试脚本已经清掉，只留上面这些常用的。
+> 需要翻旧的就看 `cache/tools_backup.zip`。
 
 ## 9. 软件内更新
 

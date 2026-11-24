@@ -53,8 +53,10 @@ UPDATE_FILES = [
     "valotalk/asr_cloud.py",
     "valotalk/capture.py",
     "valotalk/config.py",
+    "valotalk/envcheck.py",
     "valotalk/ocr.py",
     "valotalk/overlay.py",
+    "valotalk/profiles.py",
     "valotalk/remote.py",
     "valotalk/terms.py",
     "valotalk/translate.py",
@@ -63,6 +65,10 @@ UPDATE_FILES = [
     "valotalk/winapi.py",
     "valotalk/updater.py",
     "valotalk/update_ui.py",
+    # 资源：背景图是界面必需（缺了 GradientPane 直接白屏），
+    # 赞助码缺了只是关于页少一块，不致命但一起更新
+    "valotalk/assets/bg.png",
+    "valotalk/assets/sponsor.png",
     "run.bat",
     "README.md",
     "CHANGELOG.md",

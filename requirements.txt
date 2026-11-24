@@ -16,7 +16,10 @@ edge-tts>=6.1.9
 # 聊天框 OCR
 mss>=9.0
 opencv-python-headless>=4.9
-rapidocr-onnxruntime>=1.3
+# ⚠️ rapidocr-onnxruntime 只支持到 Python 3.12；3.13 上装不上（pip 会报
+#    "No matching distribution found"）。代码两种包名都认，所以按版本二选一：
+rapidocr-onnxruntime>=1.3; python_version < "3.13"
+rapidocr>=3.0; python_version >= "3.13"
 onnxruntime>=1.17
 
 # GPU 加速（无 NVIDIA 显卡可跳过；缺了会走 CPU，识别慢 15 倍以上）

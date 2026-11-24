@@ -711,6 +711,181 @@ def set_rounded_window(hwnd: int, mode: int = DWMWCP_ROUND) -> bool:
         return False
 
 
+# ---------------- 无标题栏窗口（内容顶到最上沿） ----------------
+GWLP_STYLE = -16
+WS_CAPTION = 0x00C00000        # WS_BORDER | WS_DLGFRAME，就是那条标题栏
+WS_THICKFRAME = 0x00040000     # 可拖动边缘调整大小 + 贴边吸附
+WS_SYSMENU = 0x00080000
+WS_MINIMIZEBOX = 0x00020000
+WS_MAXIMIZEBOX = 0x00010000
+SWP_NOMOVE = 0x0002
+SWP_NOSIZE = 0x0001
+SWP_NOZORDER = 0x0004
+SWP_NOACTIVATE = 0x0010
+SWP_FRAMECHANGED = 0x0020
+SW_MAXIMIZE = 3
+SW_RESTORE = 9
+MONITOR_DEFAULTTONEAREST = 2
+
+
+class _MARGINS(ctypes.Structure):
+    _fields_ = [("cxLeftWidth", ctypes.c_int),
+                ("cxRightWidth", ctypes.c_int),
+                ("cyTopHeight", ctypes.c_int),
+                ("cyBottomHeight", ctypes.c_int)]
+
+
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_ulong),
+                ("rcMonitor", ctypes.wintypes.RECT),
+                ("rcWork", ctypes.wintypes.RECT),
+                ("dwFlags", ctypes.c_ulong)]
+
+
+def strip_caption(hwnd: int) -> bool:
+    """去掉系统标题栏，让客户区顶到窗口最上沿。
+
+    只动 WS_CAPTION，保留 WS_THICKFRAME（边缘拖拽 + 贴边吸附）、
+    WS_SYSMENU（Alt+F4 / 系统菜单）和最小/最大化位。
+    去掉后系统的最小化/还原/关闭按钮会消失，需要自己画。
+    """
+    try:
+        user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.GetWindowLongW.restype = ctypes.c_long
+        user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int,
+                                          ctypes.c_long]
+        user32.SetWindowLongW.restype = ctypes.c_long
+        user32.SetWindowPos.argtypes = [
+            wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+        user32.SetWindowPos.restype = wintypes.BOOL
+
+        style = user32.GetWindowLongW(wintypes.HWND(hwnd), GWLP_STYLE)
+        if not style:
+            return False
+        # 先改样式（这一步成功了才算数）
+        user32.SetWindowLongW(wintypes.HWND(hwnd), GWLP_STYLE,
+                              ctypes.c_long(style & ~WS_CAPTION))
+        # 再让系统重算边框。这一步失败也无所谓 —— 样式已经改掉了，
+        # 窗口下次重绘时会自己收敛，不能因为它抛异常就报「没成功」。
+        try:
+            user32.SetWindowPos(wintypes.HWND(hwnd), wintypes.HWND(0),
+                                0, 0, 0, 0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
+                                | SWP_NOACTIVATE | SWP_FRAMECHANGED)
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def keep_shadow(hwnd: int) -> bool:
+    """让 DWM 继续画窗口阴影和圆角。
+
+    去掉标题栏后 DWM 可能认为这个窗口不需要装饰 —— 阴影会一起没掉，
+    窗口就像一块贴纸。DwmExtendFrameIntoClientArea 给它补一个 1px 的
+    扩展框，阴影、圆角、淡入淡出动画都会回来。
+    """
+    try:
+        dwm = ctypes.WinDLL("dwmapi")
+        m = _MARGINS(1, 1, 1, 1)
+        r = dwm.DwmExtendFrameIntoClientArea(hwnd, ctypes.byref(m))
+        return r == 0
+    except Exception:
+        return False
+
+
+def work_area(hwnd: int) -> tuple[int, int, int, int]:
+    """窗口所在显示器的可用区域（扣掉任务栏）：(x, y, 宽, 高)。"""
+    try:
+        user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+        user32.MonitorFromWindow.restype = wintypes.HANDLE
+        user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE,
+                                           ctypes.c_void_p]
+        user32.GetMonitorInfoW.restype = wintypes.BOOL
+
+        hmon = user32.MonitorFromWindow(wintypes.HWND(hwnd),
+                                        MONITOR_DEFAULTTONEAREST)
+        mi = _MONITORINFO()
+        mi.cbSize = ctypes.sizeof(_MONITORINFO)
+        if not user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+            return (0, 0, 0, 0)
+        r = mi.rcWork
+        return (r.left, r.top, r.right - r.left, r.bottom - r.top)
+    except Exception:
+        return (0, 0, 0, 0)
+
+
+def maximize_to_work_area(hwnd: int) -> None:
+    """最大化到「可用区域」而不是整块屏幕。
+
+    去标题栏后系统最大化会把任务栏盖住（它按 rcMonitor 算），
+    所以自己按 rcWork 算一次。
+    """
+    x, y, w, h = work_area(hwnd)
+    if w <= 0 or h <= 0:
+        try:
+            user32.ShowWindow(wintypes.HWND(hwnd), SW_MAXIMIZE)
+        except Exception:
+            pass
+        return
+    try:
+        user32.SetWindowPos.argtypes = [
+            wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+        user32.SetWindowPos.restype = wintypes.BOOL
+        user32.SetWindowPos(wintypes.HWND(hwnd), wintypes.HWND(0),
+                            x, y, w, h,
+                            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED)
+    except Exception:
+        pass
+
+
+def round_window_region(hwnd: int, radius: int,
+                        dpi_scale: float = 1.0) -> bool:
+    """用窗口区域把窗口裁成大圆角。
+
+    为什么不用 DWM：`DWMWA_WINDOW_CORNER_PREFERENCE` 只有「圆 / 小圆 / 不圆」
+    三档，实际半径是系统定的（Win11 约 8px），改不了。想要 20px+ 的大 R 角
+    只能自己裁剪窗口区域。
+
+    代价：SetWindowRgn 会关掉 DWM 的阴影和抗锯齿，边缘会有 1px 台阶。
+    在深色背景 + 大圆角下不明显，配合窗口外一圈背景图基本看不出来。
+    """
+    try:
+        gdi = ctypes.WinDLL("gdi32", use_last_error=True)
+        gdi.CreateRoundRectRgn.argtypes = [
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int]
+        gdi.CreateRoundRectRgn.restype = wintypes.HANDLE
+        user32.SetWindowRgn.argtypes = [wintypes.HWND, wintypes.HANDLE,
+                                        wintypes.BOOL]
+        user32.SetWindowRgn.restype = ctypes.c_int
+        user32.GetWindowRect.argtypes = [wintypes.HWND,
+                                         ctypes.POINTER(wintypes.RECT)]
+        user32.GetWindowRect.restype = wintypes.BOOL
+
+        r = wintypes.RECT()
+        if not user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(r)):
+            return False
+        w = r.right - r.left
+        h = r.bottom - r.top
+        if w <= 0 or h <= 0:
+            return False
+
+        d = max(2, int(radius * 2 * dpi_scale))   # 直径，不是半径
+        rgn = gdi.CreateRoundRectRgn(0, 0, w + 1, h + 1, d, d)
+        if not rgn:
+            return False
+        # 成功后区域归系统所有，不要再 DeleteObject
+        ok = user32.SetWindowRgn(wintypes.HWND(hwnd), wintypes.HANDLE(rgn),
+                                 True)
+        return bool(ok)
+    except Exception:
+        return False
+
+
 def set_dark_titlebar(hwnd: int, dark: bool = True) -> bool:
     """标题栏深色（Win11 / 新版 Win10）。"""
     try:

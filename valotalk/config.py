@@ -31,14 +31,18 @@ DEFAULTS: dict = {
         "backend": "cloud",
         # 云端 ASR 服务商：deepseek / dashscope / openai
         #   留空则按 cloud_base_url 自动判断
-        #   DeepSeek   → POST {base}/tools/asr
         #   dashscope  → 百炼原生多模态（qwen3-asr-flash）
         #   openai     → POST {base}/audio/transcriptions（OpenAI / 硅基流动 /
-        #                火山 / 自建 whisper-server 都走这个）
+        #                Groq / 火山 / 自建 whisper-server 都走这个）
+        #   deepseek   → POST {base}/tools/asr（⚠️ 官方文档没有这个接口，
+        #                只在确认你的中转支持时才用）
         "cloud_provider": "",
-        "cloud_base_url": "",          # 留空用该服务商的默认地址
-        "cloud_model": "",             # 留空用默认（dashscope 是 qwen3-asr-flash）
-        "cloud_api_key": "",           # 留空则复用 translate.llm.api_key
+        # 下面三项留空 = **跟随 translate.llm**（识别复用翻译那栏的
+        # base_url / model / api_key），填了就单独覆盖识别这条链路
+        "cloud_base_url": "",          # 留空 = 用翻译栏的 base_url
+        "cloud_model": "",             # 留空 = dashscope 用 qwen3-asr-flash，
+        #                                openai 兼容沿用翻译栏的 model
+        "cloud_api_key": "",           # 留空 = 用翻译栏的 api_key
         "cloud_timeout": 30,
         "cloud_fallback": True,        # 云端失败时自动退回本地
     },
@@ -70,6 +74,15 @@ DEFAULTS: dict = {
             "gap_max_step_ms": 60,     # 等待时长单次最多变多少，防抖动
             "check_fast_ms": 120,      # 检测到语音快说完时的加急轮询间隔
         },
+    },
+    # ---- 模型配置库：一套 base_url + api_key 存一条，识别和 LLM 共用 ----
+    # 主页功能区的「语音识别」「LLM」两行从这里选配置 + 填模型名。
+    # 老的 translate.llm.* / asr.cloud_* 仍然有效（启用时会把值同步过去），
+    # 首次启动会自动把已有配置迁移成第一条。
+    "models": {
+        "profiles": [],                # [{"name","base_url","api_key"}]
+        "asr": {"profile": "", "model": "qwen3-asr-flash", "enabled": True},
+        "llm": {"profile": "", "model": "qwen-plus", "enabled": True},
     },
     "translate": {
         "backend": "auto",             # auto / llm / bing / google

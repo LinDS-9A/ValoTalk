@@ -1,5 +1,9 @@
 """云端语音识别：可接多家服务，不绑定某一家。
 
+★ 2026-11-23：和翻译那栏打通 —— `asr.cloud_*` 留空时**直接跟随 `translate.llm`**
+（base_url / model / api_key），用户只要填过一次 LLM，识别就自动用同一套配置，
+不用再单独配一遍。要单独用别家再填 asr.cloud_* 覆盖即可。
+
 支持三种协议（按 cloud_provider 选，或从 base_url 自动猜）：
 
   deepseek  POST {base}/tools/asr            multipart, 字段 file
@@ -9,14 +13,18 @@
 
 换服务商只需改配置，不用改代码：
 
-  DeepSeek   "cloud_provider": "deepseek",  "cloud_base_url": "",
-             "cloud_api_key": "<deepseek key>"
   阿里云      "cloud_provider": "dashscope", "cloud_model": "qwen3-asr-flash"
   硅基流动    "cloud_provider": "openai",
              "cloud_base_url": "https://api.siliconflow.cn/v1",
              "cloud_model": "FunAudioLLM/SenseVoiceSmall"
+  Groq       "cloud_provider": "openai",
+             "cloud_base_url": "https://api.groq.com/openai/v1",
+             "cloud_model": "whisper-large-v3-turbo"
   本地服务    "cloud_provider": "openai",
              "cloud_base_url": "http://127.0.0.1:8080/v1"
+
+⚠️ DeepSeek 官方 API 只有 chat 那一套，文档里没有语音识别端点；
+   拿它的 key 填识别栏大概率只会 401。要识别请用真正支持 /audio/transcriptions 的服务。
 
 延迟实测（复用 HTTP 连接是关键，不复用慢 10 倍）：
     2.04s 音频 → 首次 3.45s（TLS 握手），之后 0.34s
@@ -63,6 +71,26 @@ PROVIDERS: dict[str, dict] = {
 }
 
 DEFAULT_MODEL = "qwen3-asr-flash"
+
+
+def _origin(url: str) -> str:
+    """只保留 scheme://host[:port]，去掉所有路径。
+
+    阿里云百炼的原生 ASR 接口是 /api/v1/services/...，
+    而翻译那栏的 base_url 往往带 /compatible-mode/v1 后缀，直接拼会 404。
+    """
+    try:
+        from urllib.parse import urlsplit
+        p = urlsplit(url if "//" in url else "https://" + url)
+        if p.scheme and p.netloc:
+            return f"{p.scheme}://{p.netloc}"
+    except Exception:
+        pass
+    # 退路：手动切
+    parts = url.split("/")
+    if len(parts) >= 3:
+        return "/".join(parts[:3])
+    return url.rstrip("/")
 
 
 def guess_provider(base_url: str) -> str:
@@ -141,31 +169,82 @@ class CloudASR:
         self._sig: tuple = ()            # 端点/密钥指纹，变了就重建 session
 
     # ---------------- 配置 ----------------
-    @property
-    def api_key(self) -> str:
-        own = str(self._get("asr.cloud_api_key", "") or "").strip()
-        return own or str(self._get("translate.llm.api_key", "") or "").strip()
+    def _llm(self, key: str) -> str:
+        """翻译那栏（translate.llm.*）—— 识别默认跟着它走。"""
+        return str(self._get("translate.llm." + key, "") or "").strip()
 
-    @property
-    def base_url(self) -> str:
+    def _explicit_base(self) -> str:
+        """用户自己填的 base_url（识别专用优先，其次翻译那栏）；都没填返回空。
+
+        ⚠️ 单独拆出来是为了避免 provider ↔ base_url 互相递归。
+        """
         own = str(self._get("asr.cloud_base_url", "") or "").strip()
         if own:
             return own.rstrip("/")
-        prov = self.provider
-        return PROVIDERS[prov]["base"]
+        return self._llm("base_url").rstrip("/")
+
+    @property
+    def api_key(self) -> str:
+        own = str(self._get("asr.cloud_api_key", "") or "").strip()
+        return own or self._llm("api_key")
 
     @property
     def provider(self) -> str:
         want = str(self._get("asr.cloud_provider", "") or "").strip().lower()
         if want in PROVIDERS:
             return want
-        return guess_provider(str(self._get("asr.cloud_base_url", "") or ""))
+        return guess_provider(self._explicit_base())
+
+    @property
+    def base_url(self) -> str:
+        """识别用的地址。优先级从高到低：
+
+        1. asr.cloud_base_url（用户为识别单独填的）
+        2. asr.cloud_provider 显式指定 → 该服务商的默认地址
+           （不要跟翻译那栏混：翻译可能走通义网关，识别走 DeepSeek）
+        3. 都没配 → 跟随 translate.llm.base_url（最常见：一套 key 两用）
+        4. 还不行 → 服务商默认地址
+
+        阿里云百炼的原生接口挂在**根域**下
+        (/api/v1/services/aigc/multimodal-generation/generation)，
+        不能带翻译那栏的 /compatible-mode/v1 后缀，
+        否则拼出来是 /compatible-mode/v1/api/v1/services/... → 404。
+        """
+        own = str(self._get("asr.cloud_base_url", "") or "").strip()
+        if own:
+            explicit = own.rstrip("/")
+            return _origin(explicit) if self.provider == "dashscope" else explicit
+
+        prov_explicit = str(self._get("asr.cloud_provider", "")
+                            or "").strip().lower()
+        if prov_explicit in PROVIDERS:
+            return PROVIDERS[prov_explicit]["base"]
+
+        llm_base = self._llm("base_url").rstrip("/")
+        if llm_base:
+            return _origin(llm_base) if self.provider == "dashscope" else llm_base
+        return PROVIDERS[self.provider]["base"]
+
+    @property
+    def follows_llm(self) -> bool:
+        """识别是不是在跟着翻译那栏走（界面用来解释「为什么是这个地址」）。"""
+        own = str(self._get("asr.cloud_base_url", "") or "").strip()
+        if own:
+            return False
+        prov_explicit = str(self._get("asr.cloud_provider", "")
+                            or "").strip().lower()
+        if prov_explicit in PROVIDERS:
+            return False
+        return bool(self._llm("base_url"))
 
     @property
     def model(self) -> str:
         own = str(self._get("asr.cloud_model", "") or "").strip()
         if own:
             return own
+        # 不借用翻译栏的模型名：deepseek-chat / qwen-plus 这类是**聊天**模型，
+        # 拿去请求 /audio/transcriptions 只会 400。OpenAI 兼容这边默认 whisper-1，
+        # 别的服务（硅基流动 SenseVoice、Groq whisper-large-v3）自己填。
         return PROVIDERS[self.provider].get("model", "")
 
     def available(self) -> bool:
@@ -226,6 +305,21 @@ class CloudASR:
             self._session = None
             self.warmed = False
 
+    def probe(self) -> tuple[bool, str]:
+        """「测一下」按钮用：发一段 0.5 秒正弦，看这家的识别到底通不通。
+
+        返回 (ok, 给用户看的话)。401/404 要说人话，别让用户对着一串 JSON 猜。
+        """
+        if not self.available():
+            return False, "没填密钥（识别栏或翻译栏都空着）"
+        try:
+            t0 = time.time()
+            pcm = 0.05 * np.sin(np.arange(8000, dtype=np.float32) * 0.1)
+            self._call(pcm, "en", timeout=25)
+            return True, f"{self.describe()} 可用（{time.time() - t0:.1f}s）"
+        except Exception as exc:
+            return False, _friendly_error(exc, self.provider, self.base_url)
+
     # ---------------- 识别 ----------------
     def transcribe(self, pcm16k: np.ndarray, language: str | None = None) -> str:
         if not self.available():
@@ -242,7 +336,7 @@ class CloudASR:
             self.last_error = ""
             return _clean(text)
         except Exception as exc:
-            self.last_error = f"{type(exc).__name__}: {str(exc)[:120]}"
+            self.last_error = _friendly_error(exc, self.provider, self.base_url)
             return ""
 
     # ---------------- 协议分派 ----------------
@@ -329,3 +423,35 @@ def _clean(text: str) -> str:
     if re.fullmatch(r"[\W_♪♫\[\]()（）\s]*", t):
         return ""
     return t
+
+
+def _friendly_error(exc: Exception, provider: str, base_url: str) -> str:
+    """把 HTTP 报错翻译成用户能看懂的一句话。"""
+    msg = str(exc)
+    code = ""
+    m = None
+    import re
+    m = re.match(r"HTTP (\d{3}):", msg)
+    if m:
+        code = m.group(1)
+
+    host = base_url.split("//")[-1].split("/")[0]
+
+    if code in ("401", "403"):
+        if provider == "deepseek":
+            return ("这家（DeepSeek）官方没有语音识别接口，密钥再对也没用 —— "
+                    "识别请换阿里云百炼 / OpenAI 兼容的服务")
+        return f"{host} 拒绝了这把密钥（HTTP {code}）：key 填错，或者这个 key 没开通语音识别"
+    if code == "404":
+        return (f"{host} 没有这个识别接口（HTTP 404）：地址可能不是 OpenAI 兼容的 /v1，"
+                "或者这家根本不提供语音识别")
+    if code == "400":
+        detail = msg.split(":", 1)[-1].strip()[:120] if ":" in msg else ""
+        return f"{host} 说请求不对（HTTP 400）：{detail}"
+    if code == "429":
+        return f"{host} 限流了（HTTP 429），等一会儿再试或换一家"
+    if "Timeout" in msg or "timed out" in msg.lower():
+        return f"{host} 连不上或太慢（超时）"
+    if "Connection" in msg or "NameResolution" in msg or "SSL" in msg:
+        return f"{host} 连不上：检查网络，或者 base_url 写错"
+    return msg[:160]
