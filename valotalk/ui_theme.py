@@ -98,6 +98,37 @@ def round_image(w: int, h: int, radius: int, color: str,
     return photo
 
 
+def toggle_image(w: int, h: int, on: bool, track: str, bg: str,
+                 knob: str = "#FFFFFF") -> ImageTk.PhotoImage:
+    """把开关的「轨道 + 滑块」画成一整张图。
+
+    为什么不能分两张：滑块是圆的，但它的贴图是个正方形，圆角外必须
+    填一个颜色 —— 填轨道色就在胶囊外面戳出绿方块，填底色就在绿轨道上
+    留下白方块（用户看到的「按钮是方的」就是这个）。合成一张图后只有
+    胶囊自己的圆角，怎么放大都干净。
+    """
+    w, h = max(2, int(w)), max(4, int(h))
+    key = ("toggle", w, h, bool(on), track, bg, knob)
+    cached = _img_cache.get(key)
+    if cached is not None:
+        return cached
+    S = 4
+    img = Image.new("RGB", (w * S, h * S), bg)
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((0, 0, w * S - 1, h * S - 1),
+                        radius=(h * S) // 2, fill=track)
+    r = (h // 2 - 2) * S
+    cy = (h * S) // 2
+    cx = (w - h // 2) * S if on else (h // 2) * S
+    d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=knob)
+    img = img.resize((w, h), Image.LANCZOS)
+    photo = ImageTk.PhotoImage(img)
+    if len(_img_cache) > 400:
+        _img_cache.clear()
+    _img_cache[key] = photo
+    return photo
+
+
 def glass_image(w: int, h: int, radius: int,
                 top: str = CARD_TOP, bottom: str = CARD_BOT,
                 edge: float = 0.36, highlight: float = 0.50,
@@ -1130,16 +1161,16 @@ class RoundEntry(tk.Frame):
         self._ph = placeholder
         self._show = show
         self._showing_ph = False
+        # 不能叫 _w / _h（tkinter Widget 内部属性）
+        self._ew, self._eh = int(width), int(height)
+        self._er = radius
+        self._efill = fill
+        self._bg = bg
         self.canvas = tk.Canvas(self, width=width, height=height,
                                 highlightthickness=0, bd=0, bg=bg)
         self.canvas.pack()
-        photo = glass_image(width, height, radius,
-                            top="#%02X%02X%02X" % _mix(fill, "#FFFFFF", 0.09),
-                            bottom="#%02X%02X%02X" % _mix(fill, "#000000", 0.10),
-                            edge=0.09, highlight=0.10,
-                            outside_color=bg)
-        self.canvas.create_image(0, 0, anchor="nw", image=photo)
-        self._photo = photo
+        self._photo = None
+        self._draw()
         self.entry = tk.Entry(self.canvas, bd=0, relief="flat", bg=fill,
                               fg=TEXT, insertbackground=TEXT,
                               font=(FONT, FS), show=show)
@@ -1149,6 +1180,37 @@ class RoundEntry(tk.Frame):
             self.entry.bind("<FocusIn>", self._on_focus_in)
             self.entry.bind("<FocusOut>", self._on_focus_out)
             self._apply_ph()
+
+    def _draw(self) -> None:
+        """画圆角玻璃底。
+
+        highlight=0：这个高光在 24~30px 高的控件上就是一条 3px 宽的白带，
+        浅色卡片上像贴了张白条（用户反馈的就是它）。
+        outside_color 用当前底色（卡片 tint 会改），否则圆角外会留一圈白角。
+        """
+        bg = self.cget("bg")
+        photo = glass_image(self._ew, self._eh, self._er,
+                            top=self._efill,
+                            bottom="#%02X%02X%02X" % _mix(
+                                self._efill, "#000000", 0.07),
+                            edge=0.18, highlight=0.0, inner_shadow=0.12,
+                            outside_color=bg)
+        self._photo = photo
+        self.canvas.delete("bgimg")
+        self.canvas.create_image(0, 0, anchor="nw", image=photo,
+                                 tags="bgimg")
+        self.canvas.tag_lower("bgimg")
+
+    def refresh(self, bg: str | None = None) -> None:
+        """卡片 tint 改色后跟着重画（否则圆角外还是旧底色 = 白角）。"""
+        if bg:
+            self._bg = bg
+            try:
+                self.configure(bg=bg)
+                self.canvas.configure(bg=bg)
+            except Exception:
+                pass
+        self._draw()
 
     # -------- 水印 --------
     def _apply_ph(self) -> None:
@@ -1260,12 +1322,14 @@ class RoundCombo(tk.Canvas):
         self.delete("all")
         # highlight=0：这块不画顶部高光，否则就是那条白带。
         # 用极轻的上下渐变 + 暗细边表达「凹进去的输入框」。
+        # outside 必须取「当前」底色：卡片 tint() 会把控件的 bg 改成
+        # 卡片玻璃的实际色，还按初始的 CARD 画圆角外就会留一圈白角
         photo = glass_image(self._cw, self._ch, self._radius,
                             top=self._fill,
                             bottom="#%02X%02X%02X" % _mix(
                                 self._fill, "#000000", 0.07),
                             edge=0.18, highlight=0.0, inner_shadow=0.14,
-                            outside_color=self._bg)
+                            outside_color=self.cget("bg"))
         self._ph = photo
         self.create_image(0, 0, anchor="nw", image=photo)
 
@@ -1498,6 +1562,16 @@ class RoundCombo(tk.Canvas):
             except Exception:
                 pass
 
+    def refresh(self, bg: str | None = None) -> None:
+        """卡片 tint 改色后跟着重画（否则圆角外还是旧底色 = 白角）。"""
+        if bg:
+            self._bg = bg
+            try:
+                self.configure(bg=bg)
+            except Exception:
+                pass
+        self._draw()
+
     # ---------------------------------------------------------------- 接口
     def get(self) -> str:
         return self.var.get()
@@ -1570,17 +1644,11 @@ class ToggleRow(tk.Frame):
         c.delete("all")
         on = bool(self.var.get())
         color = GREEN if on else CARD3
-        # 圆角外填当前底色，否则 Tk 会把透明像素画成黑角
-        bg = self.cget("bg")
-        photo = round_image(self._sw, self._sh, self._sh // 2, color,
-                            outside=bg)
+        # 轨道和滑块合成一张图：分两张的话，滑块的方图圆角外总得填个色，
+        # 填轨道色会在胶囊外戳出方块、填底色会在绿底上留白方块
+        photo = toggle_image(self._sw, self._sh, on, color, self.cget("bg"))
         c.create_image(0, 0, anchor="nw", image=photo)
         self._photo = photo
-        r = self._sh // 2 - 2
-        cx = self._sw - r - 2 if on else r + 2
-        knob = round_image(r * 2, r * 2, r, "#FFFFFF", outside=bg)
-        c.create_image(cx - r, self._sh // 2 - r, anchor="nw", image=knob)
-        self._knob = knob
 
     def refresh(self, bg: str | None = None) -> None:
         """被卡片 tint() 改色后重画开关（黑角靠它跟着底色一起变）。"""

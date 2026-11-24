@@ -1228,13 +1228,11 @@ class App:
             active = key == self._current_page
             hover = key == hover_key
             if active:
-                # 选中：浅蓝玻璃垫片（浅色主题下用淡蓝底 + 蓝图标）
-                ph2 = ui.glass_image(48, 40, 14, top="#D6E6FF",
-                                     bottom="#B9D4FF", edge=0.30,
-                                     highlight=0.34, inner_shadow=0.10)
-                cv.create_image(cx - 24, 7, anchor="nw", image=ph2,
-                                tags="dockfg")
-                self._dock_active_ph = ph2
+                # 选中：淡蓝圆角垫片。用矢量多边形而不是图片 ——
+                # 图片版 glass_image 的圆角外只能填一个固定色，和 dock
+                # 自己的渐变底永远对不上，四角就会露出灰块
+                self._round_rect(cv, cx - 24, 7, cx + 24, 47, 14,
+                                 fill="#D8E7FF", outline="", tags="dockfg")
             elif hover:
                 self._round_rect(cv, cx - 24, 7, cx + 24, 47, 14,
                                  fill="#E8E8EE", outline="", tags="dockfg")
