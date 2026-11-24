@@ -80,16 +80,37 @@ _VER_RE = re.compile(r'__version__\s*=\s*["\']([\d.]+)["\']')
 
 # ---------------------------------------------------------------- 版本号
 def parse_version(text: str) -> tuple[int, ...]:
-    """'2.1.2' / 'v2.1.2' / '2.1.2-beta' → (2, 1, 2)。解析不出来返回 ()。"""
+    """版本号 → 可比较的元组。
+
+    '2.1.2'        → (2, 1, 2, 1)     正式版后缀 1
+    '2.1.2-beta'   → (2, 1, 2, 0, 0)  测试版后缀 0，序号 0
+    '2.1.2-beta2'  → (2, 1, 2, 0, 2)  测试版序号 2
+
+    为什么要带后缀：以前 '3.0.0-beta' 和 '3.0.0-beta2' 都解析成 (3,0,0)，
+    比较时相等 → 装 beta 的人永远检测不到 beta2。现在 beta 序号也参与比较，
+    并且正式版（后缀 1）排在所有测试版（后缀 0）之后。
+    """
     if not text:
         return ()
     m = re.search(r"(\d+(?:\.\d+)*)", str(text))
     if not m:
         return ()
     try:
-        return tuple(int(x) for x in m.group(1).split("."))
+        base = tuple(int(x) for x in m.group(1).split("."))
     except ValueError:
         return ()
+    low = str(text).lower()
+    if any(k in low for k in ("beta", "alpha", "rc", "pre")):
+        # 取 beta / rc / alpha 后面的序号（没有就是 0）
+        n = 0
+        mm = re.search(r"(?:beta|alpha|rc|pre)[.\-_]?(\d+)", low)
+        if mm:
+            try:
+                n = int(mm.group(1))
+            except ValueError:
+                n = 0
+        return base + (0, n)
+    return base + (1,)
 
 
 @dataclass
