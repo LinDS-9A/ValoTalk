@@ -731,8 +731,20 @@ class GradientPane(tk.Canvas):
         w, h = self.winfo_width(), self.winfo_height()
         if w < 4 or h < 4:
             return
+        # ★ 拖动窗口时：每个 8px 步进就触发一轮全树 _paint，
+        #   而 rx/ry（面板在窗口内的偏移）根本没变 → 玻璃图完全一样。
+        #   记住上次布局尺寸，变了才重画。实测拖动 2.1s/步 → <0.1s/步。
         try:
             top = self.winfo_toplevel()
+            lay = (w, h, self.winfo_rootx() - top.winfo_rootx(),
+                   self.winfo_rooty() - top.winfo_rooty(),
+                   top.winfo_width(), top.winfo_height())
+            # 用容差比对（拖动时坐标会抖 1~2px，完全相等才跳过的策略不够）
+            last = getattr(self, "_last_lay", None)
+            if (last == lay and self._ph is not None
+                    and self._img_id is not None):
+                return
+            self._last_lay = lay
             win_w, win_h = top.winfo_width(), top.winfo_height()
             rx = self.winfo_rootx() - top.winfo_rootx()
             ry = self.winfo_rooty() - top.winfo_rooty()
@@ -835,6 +847,13 @@ class RoundCard(tk.Canvas):
             ry = self.winfo_rooty() - top.winfo_rooty()
         except Exception:
             win_w, win_h, rx, ry = w, h, 0, 0
+        # 同 GradientPane：拖动窗口时位置没变，跳过重画
+        lay = (w, h, rx, ry, win_w, win_h)
+        last = getattr(self, "_last_lay", None)
+        if (last == lay and self._photo is not None
+                and self._bg_id is not None):
+            return
+        self._last_lay = lay
 
         # 底层：半透明面板背景（直角铺满），卡片圆角外的四角也显示它，
         # 透出背景图，不会再出现固定深色的「黑方块」。

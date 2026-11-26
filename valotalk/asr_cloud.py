@@ -43,6 +43,8 @@ from typing import Callable
 import numpy as np
 import requests
 
+from . import callouts
+
 __all__ = ["CloudASR", "fix_ja_terms", "PROVIDERS", "guess_provider"]
 
 # 各家的默认端点与方法
@@ -165,6 +167,7 @@ class CloudASR:
         self._session: requests.Session | None = None
         self.last_error = ""
         self.last_latency = 0.0
+        self.last_corrections: list[tuple[str, str]] = []   # 术语纠正记录
         self.warmed = False
         self._sig: tuple = ()            # 端点/密钥指纹，变了就重建 session
 
@@ -334,7 +337,12 @@ class CloudASR:
             text = self._call(audio, language or "", timeout)
             self.last_latency = time.time() - t0
             self.last_error = ""
-            return _clean(text)
+            text = _clean(text)
+            # 英文报点：把 whisper 听岔的音近词纠回来（long→law 那种）
+            self.last_corrections = []
+            if text and callouts.looks_english(text):
+                text, self.last_corrections = callouts.fix(text)
+            return text
         except Exception as exc:
             self.last_error = _friendly_error(exc, self.provider, self.base_url)
             return ""

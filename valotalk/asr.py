@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 
+from . import callouts
 from .config import CACHE_DIR
 
 _MODEL = None
@@ -282,7 +283,13 @@ class WhisperASR:
             with _MODEL_LOCK:
                 _MODEL = None
             return ""
-        return _clean_text(text, language)
+        out = _clean_text(text, language)
+        # 英文报点：whisper 在港服口音上会听成音近词（long→law、flank→flak），
+        # 这里用发音相似度纠回来。中文/日语不走这层。
+        self.last_corrections: list[tuple[str, str]] = []
+        if out and callouts.looks_english(out):
+            out, self.last_corrections = callouts.fix(out)
+        return out
 
     @staticmethod
     def _prompt_for(language: str | None) -> str | None:

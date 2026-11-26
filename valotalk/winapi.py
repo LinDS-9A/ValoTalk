@@ -214,6 +214,16 @@ class RAWINPUT(ctypes.Structure):
 
 # 声明签名：不声明的话 64 位 LPARAM/HWND 会被当 32 位 int，溢出报错
 try:
+    user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND,
+                                     ctypes.c_int, ctypes.c_int,
+                                     ctypes.c_int, ctypes.c_int,
+                                     wintypes.UINT]
+    user32.SetWindowPos.restype = wintypes.BOOL
+    user32.ReleaseCapture.argtypes = []
+    user32.ReleaseCapture.restype = wintypes.BOOL
+    user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                     wintypes.WPARAM, wintypes.LPARAM]
+    user32.SendMessageW.restype = ctypes.c_ssize_t
     user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT,
                                       wintypes.WPARAM, wintypes.LPARAM]
     user32.DefWindowProcW.restype = ctypes.c_ssize_t
@@ -653,6 +663,33 @@ SWP_NOMOVE = 0x0002
 SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
 SWP_FRAMECHANGED = 0x0020
+
+
+def quick_move(hwnd: int, x: int, y: int) -> None:
+    """用 SetWindowPos 快速移动窗口（比 Tk 的 geometry() 快很多）。
+
+    geometry() 要走 Tk 布局计算 + <Configure> 事件链，拖动时每帧都触发
+    就是几百毫秒的卡顿。SetWindowPos 直接调 Win32，不触发 Tk 布局。
+    """
+    SWP_NOSIZE = 0x0001
+    SWP_NOZORDER = 0x0004
+    SWP_NOACTIVATE = 0x0010
+    user32.SetWindowPos(wintypes.HWND(hwnd), None,
+                        int(x), int(y), 0, 0,
+                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
+
+
+def native_move(hwnd: int) -> None:
+    """让 Windows 原生拖拽窗口（ReleaseCapture + WM_NCLBUTTONDOWN）。
+
+    这是拖无边框窗口的标准做法：告诉 OS "用户在拖标题栏"，之后整个拖拽
+    由系统接管 —— 窗口整体移动，内容自动跟手，不触发 <Configure>。
+    自绘 geometry() 循环每次都要重绘，内容跟不上就是"黑块+像素块"。
+    """
+    WM_NCLBUTTONDOWN = 0x00A1
+    HTCAPTION = 2
+    user32.ReleaseCapture()
+    user32.SendMessageW(wintypes.HWND(hwnd), WM_NCLBUTTONDOWN, HTCAPTION, 0)
 
 
 def top_level_hwnd(tk_widget) -> int:

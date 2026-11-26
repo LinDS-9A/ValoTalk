@@ -13,6 +13,7 @@ import os
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -25,6 +26,7 @@ import numpy as np
 
 from . import PRERELEASE, __version__
 from . import capture, envcheck, remote, ui_theme as ui, updater, winapi
+from . import callouts
 from .asr import WhisperASR
 from .asr_cloud import CloudASR, fix_ja_terms
 from .profiles import Profiles
@@ -151,6 +153,27 @@ class Job:
     t0: float = field(default_factory=time.time)
 
 
+_SPLIT_SEP = re.compile(r"[，,；;、]")
+
+
+def _split_calls(text: str, max_parts: int = 3) -> str:
+    """把一条里的多个报点拆成多行。
+
+    只有「每段都很短」才拆 —— 真报点就是短句。长句原样返回，
+    免得把正常句子切碎。
+    """
+    if not text or "\n" in text:
+        return text
+    if len(text) > 24:                 # 长句是正常句子，不拆
+        return text
+    parts = [p.strip() for p in _SPLIT_SEP.split(text) if p.strip()]
+    if not (2 <= len(parts) <= max_parts):
+        return text
+    if max(len(p) for p in parts) > 16:
+        return text
+    return "\n".join(parts[:max_parts])
+
+
 class App:
     def __init__(self):
         winapi.enable_dpi_awareness()
@@ -262,41 +285,20 @@ class App:
 
         # 4:3 宽高比锁定：判断用户主要在拉宽还是拉高，按变化更大的维度
         # 修正另一个维度，保证 width:height 恒为 4:3
-        self._last_w, self._last_h = 960, 720
+        # 初始化为窗口实际尺寸（不是硬编码值，否则第一次 <Configure>
+        # 就会因为"尺寸变了"触发 _lock_aspect 调 geometry → 窗口变大）
+        try:
+            self.root.update_idletasks()
+            self._last_w, self._last_h = self.root.winfo_width(), self.root.winfo_height()
+        except Exception:
+            self._last_w, self._last_h = 1024, 768
 
         def _lock_aspect(_e=None) -> None:
-            # 绑定到 root 的 <Configure> 会收到所有子控件的事件（Tk 事件传播），
-            # 只处理窗口自身（widget 是 root）的那一次，其余直接忽略。
-            if _e is not None and getattr(_e, "widget", None) is not self.root:
-                return
-            # 最大化时不要锁比例：屏幕是 16:9，硬扳 4:3 会和 SetWindowPos
-            # 互相拉扯（Configure → geometry → Configure …），界面直接卡死
-            if getattr(self, "_is_maximized", False):
-                return
-            # 同一轮里被自己 geometry 触发的回调不再递归
-            if getattr(self, "_aspect_busy", False):
-                return
-            w = self.root.winfo_width()
-            h = self.root.winfo_height()
-            if w < 4 or h < 4:
-                return
-            if abs(w - self._last_w) >= abs(h - self._last_h):
-                want_h = int(round(w * 3 / 4))
-                if abs(h - want_h) > 1:
-                    self._aspect_busy = True
-                    try:
-                        self.root.geometry(f"{w}x{want_h}")
-                    finally:
-                        self.root.after(30, self._clear_aspect_busy)
-            else:
-                want_w = int(round(h * 4 / 3))
-                if abs(w - want_w) > 1:
-                    self._aspect_busy = True
-                    try:
-                        self.root.geometry(f"{want_w}x{h}")
-                    finally:
-                        self.root.after(30, self._clear_aspect_busy)
-            self._last_w, self._last_h = w, h
+            # ⚠️ 2026-11-26：这里原来会强制 4:3（调 geometry），导致一个
+            # 修了多次的 bug —— 窗口自己不断变大。根因是任何 <Configure>
+            # （点 combo、布局微调、拖动）都会触发它改 geometry，改动又
+            # 触发 <Configure>，形成正反馈。4:3 约束不值得这个代价，删掉。
+            pass
 
         self.root.bind("<Configure>", _lock_aspect, add=True)
 
@@ -307,6 +309,8 @@ class App:
         self._bg_photo = None
 
         def _paint_bg(_e=None):
+            if getattr(self, "_is_dragging", False):
+                return          # 拖动时跳过背景重绘
             if ui.is_lite():
                 # 简约档没有壁纸，整窗一块底色就够，省掉每次改尺寸的缩放
                 self._bg_canvas.delete("bg")
@@ -315,6 +319,10 @@ class App:
             h = self.root.winfo_height()
             if w < 4 or h < 4:
                 return
+            # 拖动窗口时尺寸没变，背景不用重画
+            if (w, h) == getattr(self, "_bg_wh", None):
+                return
+            self._bg_wh = (w, h)
             ph = ui.bg_gradient(w, h)
             self._bg_photo = ph
             self._bg_canvas.delete("bg")
@@ -410,22 +418,34 @@ class App:
         def _drag_start(e):
             if not getattr(self, "_frameless", False):
                 return
+            self._drag_moved = False
             self._drag_off = (e.x_root - self.root.winfo_x(),
                               e.y_root - self.root.winfo_y())
-            self._drag_moved = False
+            self._is_dragging = True
+            # ★ 不要用 ReleaseCapture + SendMessageW 原生拖拽：
+            #   和 Tk 事件循环不兼容，会鼠标卡死、程序闪退。
+            #   保留 geometry 拖动，但 _is_dragging 抑制所有 <Configure> 重绘。
 
         def _drag_move(e):
-            if not self._drag_off:
+            if not getattr(self, "_drag_off", None):
                 return
             dx = e.x_root - self.root.winfo_x() - self._drag_off[0]
             dy = e.y_root - self.root.winfo_y() - self._drag_off[1]
             if abs(dx) + abs(dy) > 2:
                 self._drag_moved = True
-            self.root.geometry(
-                f"+{e.x_root - self._drag_off[0]}+{e.y_root - self._drag_off[1]}")
+            nx = e.x_root - self._drag_off[0]
+            ny = e.y_root - self._drag_off[1]
+            # ★ SetWindowPos 比 geometry() 快：后者走 Tk 布局 + <Configure>，
+            #   前者直接 Win32，拖动时不卡
+            try:
+                hwnd = winapi.top_level_hwnd(self.root)
+                winapi.quick_move(hwnd, nx, ny)
+            except Exception:
+                self.root.geometry(f"+{nx}+{ny}")
 
         def _drag_end(_e):
             self._drag_off = None
+            self._is_dragging = False
 
         def _head_dblclick(_e):
             if getattr(self, "_frameless", False):
@@ -892,6 +912,13 @@ class App:
             def _resize_region(_e=None):
                 if _e is not None and getattr(_e, "widget", None) is not self.root:
                     return
+                if getattr(self, "_is_dragging", False):
+                    return      # 拖动时跳过 SetWindowRgn
+                # 拖动窗口时尺寸没变，SetWindowRgn 不用重做
+                w, h = self.root.winfo_width(), self.root.winfo_height()
+                if (w, h) == getattr(self, "_region_wh", None):
+                    return
+                self._region_wh = (w, h)
                 self.root.after_idle(self._apply_win_radius)
 
             self.root.bind("<Configure>", _resize_region, add=True)
@@ -977,10 +1004,15 @@ class App:
 
         def _motion(e):
             mode = _hit(e)
-            try:
-                self.root.configure(cursor=CURSORS.get(mode, "arrow"))
-            except Exception:
-                pass
+            # ★ 只在 cursor 变了才 configure：每次都改 cursor 会触发 Tk
+            #   重新计算布局，拖动时就是 60 次/秒的白做
+            cur = CURSORS.get(mode, "arrow")
+            if cur != getattr(state, "_cursor", None):
+                state["_cursor"] = cur
+                try:
+                    self.root.configure(cursor=cur)
+                except Exception:
+                    pass
             if state["mode"]:
                 # 正在拖边缘
                 dx = e.x_root - state["px"]
@@ -1000,11 +1032,22 @@ class App:
                     h = nh
                 if "b" in m:
                     h = max(min_h, h + dy)
-                self.root.geometry(f"{w}x{h}+{x}+{y}")
+                # ★ resize 时设 _aspect_busy：防止 _lock_aspect 收到
+                #   <Configure> 后又强行改 geometry，造成两边互相拉扯
+                self._aspect_busy = True
+                try:
+                    self.root.geometry(f"{w}x{h}+{x}+{y}")
+                finally:
+                    self.root.after(10, self._clear_aspect_busy)
                 state.update(w=w, h=h, x=x, y=y,
                              px=e.x_root, py=e.y_root)
 
         def _press(e):
+            # ★ 只处理 root 本身的边缘事件。子控件（滚动条、按钮等）的
+            #   ButtonPress 会冒泡到 root，以前拖滚动条就会被当成缩放。
+            if getattr(e, "widget", None) is not self.root:
+                state["mode"] = None
+                return
             mode = _hit(e)
             if not mode:
                 return
@@ -1016,6 +1059,11 @@ class App:
 
         def _release(_e=None):
             state["mode"] = None
+            state["_cursor"] = "arrow"
+            try:
+                self.root.configure(cursor="arrow")
+            except Exception:
+                pass
 
         self.root.bind("<Motion>", _motion, add="+")
         self.root.bind("<ButtonPress-1>", _press, add="+")
@@ -1024,6 +1072,23 @@ class App:
     def _clear_aspect_busy(self) -> None:
         """4:3 锁定的防递归标记，隔一轮再放开。"""
         self._aspect_busy = False
+
+    def _safe_native_drag(self, hwnd: int) -> None:
+        """安全启动 Windows 原生窗口拖拽。
+
+        ReleaseCapture + WM_NCLBUTTONDOWN(HTCAPTION) 是拖无边框窗口的
+        标准做法：系统整体移动窗口，内容自动跟手，不触发 <Configure>。
+        但 SendMessageW 是阻塞调用（进入 OS 模态循环直到松开鼠标），
+        所以必须在 after() 回调里调，不能在 <Button-1> 处理器里直接调
+        （ReleaseCapture 会释放 Tk 的鼠标捕获，导致鼠标卡死、程序崩溃）。
+        """
+        try:
+            winapi.native_move(hwnd)
+        except Exception:
+            # 原生拖拽失败 → 回退到 geometry 方式
+            # （_drag_start 的 except 分支只处理 hwnd 获取失败，
+            #   native_move 失败在这里兜住）
+            pass
 
     def _minimize(self) -> None:
         """最小化。去标题栏后系统按钮没了，走 Win32 而不是 tk 的 iconify，
@@ -2948,6 +3013,14 @@ class App:
                 self.log(f"[纠错] {text} → {fixed}")
                 text = fixed
 
+        # 英文报点术语纠正（To A long 听成 To a law 这类）。
+        # 改是在后端 transcribe() 里做的（云端/本地各一处），这里只负责记录，
+        # 让用户在日志里看得见「我纠了什么」，不然会以为听错了。
+        src = self.asr_cloud if job.asr_backend == "cloud" else self.asr
+        corr = getattr(src, "last_corrections", None) or []
+        if corr:
+            self.log("[术语] " + "，".join(f"{a} → {b}" for a, b in corr))
+
         job.detected_lang = lang if job.asr_backend == "cloud" else \
             (getattr(self.asr, "last_language", None) or lang)
         return text
@@ -3254,6 +3327,11 @@ class App:
             f"当前版本 v{__version__}，没有可用的更新。", kind="ok")
 
     def _overlay(self, tag: str, text: str, original: str = "") -> None:
+        # 英文队友一口气报三条（"Two B main, spike spotted, rotate B"）时，
+        # 译文挤成一行很难扫。拆成多行，一行一个意思。
+        # 只对英文源拆 —— 中文队友的话本来就是一个整句，拆了反而碎。
+        if tag == "队友" and original and callouts.looks_english(original):
+            text = _split_calls(text)
         self._ui_call(self.overlay, "add", tag, text, original)
 
     def _ui_state(self, text: str, color: str) -> None:
