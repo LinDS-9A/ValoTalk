@@ -105,7 +105,7 @@ DEFAULTS: dict = {
         "engine": "auto",              # auto / rapidocr / winrt
         "region": [0, 0, 0, 0],        # [x1,y1,x2,y2]，全 0 表示未设置
         "interval_ms": 2500,           # 聊天扫描间隔；抓屏会读回显存，别太勤
-        "idle_backoff_max": 4.0,       # 连续没新消息时间隔最多拉长到几倍
+        "idle_backoff_max": 8.0,       # 连续没新消息时间隔最多拉长到几倍
         # OCR 线程数：1=省 CPU(829ms) 2=平衡(650ms) 4=最快(625ms)
         # 墙钟越短聊天译文出得越快，但 CPU 总量成倍涨（打游戏会掉帧）
         "onnx_threads": 2,

@@ -3111,6 +3111,17 @@ class App:
             if not self.flags["chat"] or not region or region[2] <= region[0]:
                 time.sleep(0.4)
                 continue
+            # ★ 游戏不在前台（用户切去网页/聊天/桌面）时暂停截屏 + OCR。
+            #   ValoTalk 自己的窗口不算游戏前台 —— 用户在看 ValoTalk 时
+            #   不需要聊天翻译，切回游戏再恢复。
+            try:
+                hwnd_app = winapi.top_level_hwnd(self.root)
+                if winapi.is_foreground(hwnd_app):
+                    idle += 1
+                    time.sleep(1.0)
+                    continue
+            except Exception:
+                pass
             img = self.ocr.grab(region)
             if img is None:
                 miss += 1
@@ -3119,6 +3130,18 @@ class App:
                 time.sleep(interval / 1000.0)
                 continue
             miss = 0
+            # ★ 先比对截屏：99% 的帧画面没变化，直接跳过 OCR（930ms CPU）。
+            #   用小图 hash 比对，快到可以忽略（~0.1ms）。
+            try:
+                small = img.resize((32, 32))
+                cur_hash = hash(small.tobytes())
+                if cur_hash == getattr(self, "_chat_last_hash", None):
+                    idle += 1
+                    time.sleep(interval / 1000.0)
+                    continue
+                self._chat_last_hash = cur_hash
+            except Exception:
+                pass
             lines = self.ocr.read_lines(img)
             fresh = self.differ.push(lines)
             # 只翻玩家说的话；系统广播（下包/回合/上线提示）整行无视

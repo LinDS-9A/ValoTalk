@@ -219,6 +219,8 @@ try:
                                      ctypes.c_int, ctypes.c_int,
                                      wintypes.UINT]
     user32.SetWindowPos.restype = wintypes.BOOL
+    user32.GetForegroundWindow.argtypes = []
+    user32.GetForegroundWindow.restype = wintypes.HWND
     user32.ReleaseCapture.argtypes = []
     user32.ReleaseCapture.restype = wintypes.BOOL
     user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
@@ -663,6 +665,15 @@ SWP_NOMOVE = 0x0002
 SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
 SWP_FRAMECHANGED = 0x0020
+
+
+def is_foreground(hwnd: int) -> bool:
+    """检查某个窗口是否是当前前台窗口（用户正在操作的那个）。"""
+    try:
+        fg = user32.GetForegroundWindow()
+        return bool(fg) and int(fg) == int(hwnd)
+    except Exception:
+        return True   # 检测失败时按前台处理，别因此停掉 OCR
 
 
 def quick_move(hwnd: int, x: int, y: int) -> None:
