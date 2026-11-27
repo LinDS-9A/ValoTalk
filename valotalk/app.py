@@ -3114,9 +3114,12 @@ class App:
             # ★ 游戏不在前台（用户切去网页/聊天/桌面）时暂停截屏 + OCR。
             #   ValoTalk 自己的窗口不算游戏前台 —— 用户在看 ValoTalk 时
             #   不需要聊天翻译，切回游戏再恢复。
+            # 游戏不在前台时暂停截屏 + OCR。
+            # 检测失败时不暂停（宁可多跑也不要漏翻译）。
             try:
                 hwnd_app = winapi.top_level_hwnd(self.root)
-                if winapi.is_foreground(hwnd_app):
+                fg = winapi.is_foreground(hwnd_app)
+                if fg is True:
                     idle += 1
                     time.sleep(1.0)
                     continue
@@ -3133,7 +3136,10 @@ class App:
             # ★ 先比对截屏：99% 的帧画面没变化，直接跳过 OCR（930ms CPU）。
             #   用小图 hash 比对，快到可以忽略（~0.1ms）。
             try:
-                small = img.resize((32, 32))
+                # numpy 的 resize 是原地操作返回 None，不能当 PIL 用。
+                # 用切片降采样 + 均值做快速指纹。
+                small = img[::max(1, img.shape[0] // 32),
+                            ::max(1, img.shape[1] // 32)]
                 cur_hash = hash(small.tobytes())
                 if cur_hash == getattr(self, "_chat_last_hash", None):
                     idle += 1

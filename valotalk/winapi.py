@@ -668,12 +668,15 @@ SWP_FRAMECHANGED = 0x0020
 
 
 def is_foreground(hwnd: int) -> bool:
-    """检查某个窗口是否是当前前台窗口（用户正在操作的那个）。"""
+    """检查某个窗口是否是当前前台窗口（用户正在操作的那个）。
+
+    检测失败返回 False：宁可多跑 OCR 也不要因为检测失败漏掉翻译。
+    """
     try:
         fg = user32.GetForegroundWindow()
         return bool(fg) and int(fg) == int(hwnd)
     except Exception:
-        return True   # 检测失败时按前台处理，别因此停掉 OCR
+        return False  # 检测失败时不停 OCR
 
 
 def quick_move(hwnd: int, x: int, y: int) -> None:
