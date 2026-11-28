@@ -235,7 +235,9 @@ class App:
             token=str(self._get("remote.token", "") or ""),
         )
         # 渲染档位必须在建控件之前定好：控件构造时就会按档位画图
-        ui.set_mode(str(self._get("ui.render_mode", "glass") or "glass"))
+        # ★ 默认「简约」（纯色渲染，省 CPU）。
+        #   用户手动切到「毛玻璃」后配置里记住了，下次打开还是毛玻璃。
+        ui.set_mode(str(self._get("ui.render_mode", "lite") or "lite"))
         self._build_ui()
         self._bind_hotkeys()
         # 注意：这几个必须在 _build_ui() 之后初始化 —— _build_ui 末尾会把
@@ -3077,7 +3079,12 @@ class App:
 
     # ============================================================ 启停
     def _autostart(self) -> None:
-        self.start()
+        """程序启动后不再自动运行 —— 保持停止状态，让用户自己点「开始」。
+
+        之前是启动就自动开采集（_running=True），用户反馈打开就跑
+        浪费资源。现在默认停止，界面上点「开始」才跑。
+        """
+        self._ui_state("● 已停止（点「开始」运行）", "#f87171")
 
     def start(self) -> None:
         if self._running:
