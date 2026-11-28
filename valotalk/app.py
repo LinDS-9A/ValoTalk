@@ -2799,6 +2799,30 @@ class App:
         except Exception as e:
             self.log(f"[剪贴板] 复制失败：{e}")
 
+    def _maybe_lite_on_game(self) -> None:
+        """游戏在前台时自动切「简约」渲染，切回来恢复「毛玻璃」。
+
+        只在真正变化时切（避免每帧都调 set_mode + 重绘）。
+        """
+        try:
+            # 用 ValoTalk 自己是否在前台来判断：不在前台 = 游戏在前台
+            hwnd_app = winapi.top_level_hwnd(self.root)
+            game_active = not winapi.is_foreground(hwnd_app)
+        except Exception:
+            return
+        want = "lite" if game_active else "glass"
+        if ui.is_lite() == (want == "lite"):
+            return                              # 已经是目标状态
+        if not self._get("ui.auto_lite_on_game", True):
+            return                              # 用户关了自动切换
+        ui.set_mode(want)
+        try:
+            self._repaint_all()
+        except Exception:
+            pass
+        self.log(f"[性能] 游戏{'在' if game_active else '不在'}前台 → "
+                 f"切到{'简约' if want == 'lite' else '毛玻璃'}渲染")
+
     def _review_subtitles(self) -> None:
         """热键回看最近几条字幕（队友刚说的没看清时用）。"""
         items = self.overlay.recent(5)
@@ -3061,6 +3085,8 @@ class App:
         self._running = True
         self.differ.reset()
         self._ui_state("● 启动中…", "#fbbf24")
+        # ★ 点开始后隐藏主窗口，只留小控制条 —— UI 渲染不占 CPU
+        self._show_mini_bar()
 
         threading.Thread(target=self._boot_bg, daemon=True).start()
         threading.Thread(target=self._asr_worker, name="asr-worker", daemon=True).start()
@@ -3131,6 +3157,75 @@ class App:
         self._chat_stop.set()
         self._ui_state("● 已停止", "#f87171")
         self.log("已停止采集。")
+        self._hide_mini_bar()
+
+    def _show_mini_bar(self) -> None:
+        """隐藏主窗口，显示小悬浮控制条（状态 + 停止 + 点击还原）。"""
+        if getattr(self, "_mini_bar", None):
+            return
+        self.root.withdraw()              # 隐藏主窗口（不渲染 = 不占 CPU）
+        top = tk.Toplevel(self.root)
+        top.title("")
+        top.overrideredirect(True)
+        top.attributes("-topmost", True)
+        top.configure(bg="#1E1E2E")
+
+        frame = tk.Frame(top, bg="#1E1E2E", padx=8, pady=5)
+        frame.pack()
+
+        # 状态指示
+        self._mini_status = tk.Label(
+            frame, text="● 运行中", bg="#1E1E2E", fg="#34d399",
+            font=(ui.FONT, 9, "bold"))
+        self._mini_status.pack(side="left", padx=(0, 10))
+
+        # 停止按钮
+        stop_btn = tk.Label(
+            frame, text="■ 停止", bg="#E5484D", fg="#FFFFFF",
+            font=(ui.FONT, 8, "bold"), padx=8, pady=2, cursor="hand2")
+        stop_btn.pack(side="left", padx=(0, 6))
+        stop_btn.bind("<Button-1>", lambda _e: self.stop())
+
+        # 还原主窗口
+        show_btn = tk.Label(
+            frame, text="▲ 窗口", bg="#3A3A4E", fg="#FFFFFF",
+            font=(ui.FONT, 8, "bold"), padx=8, pady=2, cursor="hand2")
+        show_btn.pack(side="left")
+        show_btn.bind("<Button-1>", lambda _e: self._hide_mini_bar())
+
+        # 定位到屏幕右下角
+        top.update_idletasks()
+        w, h = top.winfo_width(), top.winfo_height()
+        sw = top.winfo_screenwidth()
+        sh = top.winfo_screenheight()
+        top.geometry(f"+{sw - w - 20}+{sh - h - 60}")
+
+        # 拖动
+        def _drag_start(e):
+            top._dx = e.x_root - top.winfo_x()
+            top._dy = e.y_root - top.winfo_y()
+
+        def _drag_move(e):
+            top.geometry(f"+{e.x_root - top._dx}+{e.y_root - top._dy}")
+
+        frame.bind("<Button-1>", _drag_start)
+        frame.bind("<B1-Motion>", _drag_move)
+        for w2 in frame.winfo_children():
+            w2.bind("<Button-1>", _drag_start, add="+")
+            w2.bind("<B1-Motion>", _drag_move, add="+")
+
+        self._mini_bar = top
+
+    def _hide_mini_bar(self) -> None:
+        """隐藏小控制条，还原主窗口。"""
+        if getattr(self, "_mini_bar", None):
+            try:
+                self._mini_bar.destroy()
+            except Exception:
+                pass
+            self._mini_bar = None
+        self.root.deiconify()             # 还原主窗口
+        self.root.lift()
 
     def shutdown(self) -> None:
         try:
@@ -3218,19 +3313,25 @@ class App:
         """按配置选后端。云端失败且允许回退时用本地。"""
         text = ""
         if self._use_cloud_asr(lang):
+            # ★ 云端 ASR 节流：最多每 2 秒上传一次，防止占满上传带宽
+            #   导致游戏掉线（VAN 5001）。队友说话密集时自动丢弃多余请求。
+            now = time.time()
+            if now - getattr(self, "_last_cloud_asr", 0) < 2.0:
+                return ""
+            self._last_cloud_asr = now
             text = self.asr_cloud.transcribe(job.pcm, lang)
             if text:
                 job.asr_backend = "cloud"
             else:
                 err = self.asr_cloud.last_error or "返回空"
-                if self._get("asr.cloud_fallback", True):
-                    now = time.time()
-                    if now - getattr(self, "_cloud_warn_at", 0) > 60:
-                        self._cloud_warn_at = now
-                        self.log(f"[云端ASR] 失败（{err}），本次改用本地识别")
-                else:
-                    self.log(f"[云端ASR] 失败：{err}")
-                    return ""
+                # ★★ 游戏时绝不回退到本地 whisper！
+                #   本地 whisper 在 CPU 上实时率 0.24，打游戏时跑它
+                #   会把 CPU 打满 → 画面卡死 → 只能长按电源键重启。
+                #   云端失败就跳过这一句，宁可漏翻译也不让游戏卡死。
+                if now - getattr(self, "_cloud_warn_at", 0) > 60:
+                    self._cloud_warn_at = now
+                    self.log(f"[云端ASR] 失败（{err}），跳过这句（不回退本地，"
+                             f"避免占 CPU）")
 
         if not text:
             # 本地
@@ -3391,6 +3492,8 @@ class App:
                     continue
             except Exception:
                 pass
+            # ★ 游戏在前台时自动切「简约」渲染（省 CPU，对标竞品）
+            self._maybe_lite_on_game()
             img = self.ocr.grab(region)
             if img is None:
                 miss += 1

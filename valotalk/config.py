@@ -45,7 +45,10 @@ DEFAULTS: dict = {
         #                                openai 兼容沿用翻译栏的 model
         "cloud_api_key": "",           # 留空 = 用翻译栏的 api_key
         "cloud_timeout": 30,
-        "cloud_fallback": True,        # 云端失败时自动退回本地
+        "cloud_fallback": False,        # 云端失败时回退本地 whisper。
+                                         # ★ 游戏时禁用：本地 whisper 吃满 CPU
+                                         #   会直接导致画面卡死（只能长按重启）。
+                                         #   真要回退就手动改成 True。        # 云端失败时自动退回本地
     },
     "audio": {
         "game_output_device": "",      # 游戏声音输出（loopback 采集源，通常=耳机）
