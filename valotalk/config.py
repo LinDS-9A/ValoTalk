@@ -15,6 +15,7 @@ LOG_DIR = ROOT / "logs"
 
 DEFAULTS: dict = {
     "asr": {
+        "cloud_prompted": False,         # 是否已提示过「云端识别更省 CPU」
         "model": "small",              # tiny / base / small / medium
         "device": "auto",              # auto / cuda / cpu
         "compute_type": "auto",        # auto / float16 / int8 / int8_float16
@@ -112,6 +113,14 @@ DEFAULTS: dict = {
         "min_confidence": 0.50,
         "max_lines": 10,
         "translate": True,
+        "copy_to_clipboard": True,       # 我说的话翻译完自动复制到剪贴板，
+                                         # 按 Ctrl+V 就能发到游戏聊天框
+        "skip_game_audio": True,         # 让 LLM 判断「这是游戏配音」时输出 [SKIP]
+                                         # 不翻译。误杀队友的话关掉它
+    },
+    "audio": {
+        "game_process": "",              # 游戏进程名（如 VALORANT-Win64-Shipping），
+                                         # 留空不过滤；填了就只在游戏有声音时处理识别
     },
     "tts": {
         "engine": "edge",              # edge / sapi
@@ -129,6 +138,8 @@ DEFAULTS: dict = {
         "toggle_click_through": "f3",
         "clear_overlay": "f4",
         "toggle_mute_outgoing": "f5",
+        "review_subtitles": "f6",      # 回看最近几条字幕
+        "ptt_clip": "f7",              # 说中文 → 复制译文到剪贴板（不发语音）
     },
     "remote": {
         "enabled": False,              # 手机遥控（局域网 HTTP），默认关，面板上可开

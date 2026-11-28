@@ -163,16 +163,22 @@ class Updater:
 
     # ---------- 检查 ----------
     def channel(self) -> str:
-        """当前更新线路：stable / lite。
+        """当前更新线路：stable / beta / lite。
 
-        线路只是「看哪一串 release」，不改代码：轻量版是同一个仓库里
-        带 -lite 后缀的 tag，装完之后本地配置记得住自己的外观档位。
+        线路只是「看哪一串 release」，不改代码：
+        - stable：只更新到正式版（无 -beta/-lite 后缀的 tag）
+        - beta：更新到正式版或 Beta 版（无 -lite 后缀的 tag）
+        - lite：更新到轻量版（带 -lite 后缀的 tag）
         """
         try:
-            v = str(self._get("update.channel", "stable") or "stable")
+            v = str(self._get("update.channel", "stable") or "stable").lower()
         except Exception:
             v = "stable"
-        return "lite" if v.lower().startswith("lite") else "stable"
+        if v.startswith("lite"):
+            return "lite"
+        if v.startswith("beta"):
+            return "beta"
+        return "stable"
 
     def check(self, timeout: float = 12.0) -> UpdateInfo | None:
         """有新版返回 UpdateInfo，已最新/失败返回 None。
@@ -270,7 +276,13 @@ class Updater:
             picked = [v for v in versions if v.lower().endswith("-lite")]
             return picked or [v for v in versions
                               if not v.lower().endswith("-lite")]
-        return [v for v in versions if not v.lower().endswith("-lite")]
+        if ch == "beta":
+            # Beta 线：正式版 + Beta 版（排除 lite）
+            return [v for v in versions if not v.lower().endswith("-lite")]
+        # stable：只看正式版（排除 beta 和 lite）
+        return [v for v in versions
+                if not v.lower().endswith(("-lite", "-beta"))
+                and "-beta" not in v.lower()]
 
     def _latest_from_github(self, timeout: float) -> tuple[str, bool] | None:
         """从 GitHub Releases API 取最新非草稿版本的 (版本号, 是否预发布)。

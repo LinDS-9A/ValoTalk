@@ -27,6 +27,7 @@ import numpy as np
 from . import PRERELEASE, __version__
 from . import capture, envcheck, remote, ui_theme as ui, updater, winapi
 from . import callouts
+from .audio_filter import ProcessAudioFilter, is_agent_voice
 from .asr import WhisperASR
 from .asr_cloud import CloudASR, fix_ja_terms
 from .profiles import Profiles
@@ -188,6 +189,7 @@ class App:
         self.asr_cloud = CloudASR(self._get, log=self.log)
         self.translator = Translator(self._get)
         self.tts = TTS(self._get, log=self.log)
+        self.audio_filter = ProcessAudioFilter(self._get)
         self.ocr = ChatOCR(self._get)
         self.differ = LineDiffer()
 
@@ -332,6 +334,8 @@ class App:
         # add=True：不能替换掉前面 _lock_aspect 的绑定，否则 4:3 锁定会失效
         self.root.bind("<Configure>", _paint_bg, add=True)
         self.root.after(60, _paint_bg)
+        # 稍微延后：等界面画完再弹，不然会卡在启动瞬间
+        self.root.after(2500, self._maybe_prompt_cloud_asr)
 
         # 最底层就是壁纸本身：不叠任何玻璃色，让所有内容都「浮」在它上面。
         # 之前用 glass=True 会给整窗盖一层灰，背景就全被压住了。
@@ -531,6 +535,16 @@ class App:
         self.cb_mic = self._device_row(body, "我的麦克风", "audio.mic_device")
         self.cb_tts = self._device_row(body, "TTS 输出", "audio.tts_output_device")
 
+        # 设备自检：一键检测 + 自动填写（比让用户自己认设备名靠谱）
+        chk_row = tk.Frame(body, bg=ui.CARD)
+        chk_row.pack(fill="x", pady=(4, 0))
+        ui.RoundButton(chk_row, "设备检测", command=self._device_selfcheck,
+                       width=96, height=28, bg=ui.CARD).pack(side="left")
+        self._dev_hint = tk.Label(
+            chk_row, text="自动识别并填写上面三项", bg=ui.CARD, fg=ui.TEXT3,
+            font=(ui.FONT, 8), anchor="w")
+        self._dev_hint.pack(side="left", padx=(8, 0))
+
         # 服务器（就放在这里，打开就能看到）
         row = tk.Frame(body, bg=ui.CARD)
         row.pack(fill="x", pady=(6, 0))
@@ -618,6 +632,7 @@ class App:
         self.v_through = tk.BooleanVar(value=bool(self._get("overlay.click_through", True)))
         self.v_cpu = tk.BooleanVar(value=str(self._get("asr.device", "auto")) == "cpu")
         self.v_remote = tk.BooleanVar(value=bool(self._get("remote.enabled", False)))
+        self.v_clip = tk.BooleanVar(value=bool(self._get("translate.copy_to_clipboard", True)))
 
         for text, var, cb in [
             ("队友语音 → 中文字幕", self.v_team,
@@ -631,6 +646,7 @@ class App:
             ("字幕穿透鼠标", self.v_through, self._on_through_toggle),
             ("识别用 CPU（不抢显卡）", self.v_cpu, self._on_cpu_toggle),
             ("手机遥控", self.v_remote, self._on_remote_toggle),
+            ("复制译文到剪贴板", self.v_clip, self._on_clip_toggle),
         ]:
             tr = ui.ToggleRow(b2, text, var, command=cb)
             tr.pack(fill="x", pady=1)
@@ -669,22 +685,29 @@ class App:
 
         self.hk_vars: dict[str, tk.StringVar] = {}
         self.hk_combos: dict = {}
-        specs = [("ptt", "说中文"), ("toggle_click_through", "穿透"),
-                 ("clear_overlay", "清屏"), ("toggle_mute_outgoing", "静音")]
+        specs = [("ptt", "说中文（发语音）"), ("ptt_clip", "说中文（复制）"),
+                 ("toggle_click_through", "穿透"),
+                 ("clear_overlay", "清屏"), ("toggle_mute_outgoing", "静音"),
+                 ("review_subtitles", "回看")]
         cur = self._get("hotkeys", {}) or {}
-        hk_row = tk.Frame(b3, bg=ui.CARD)
-        hk_row.pack(fill="x")
-        for key, label in specs:
-            cell = tk.Frame(hk_row, bg=ui.CARD)
-            cell.pack(side="left", padx=(0, 6))
-            tk.Label(cell, text=label, bg=ui.CARD, fg=ui.TEXT2,
-                     font=(ui.FONT, ui.FS_SMALL), anchor="w").pack(anchor="w")
-            rc = ui.RoundCombo(cell, winapi.HOTKEY_CHOICES, width=96, height=28)
-            rc.set(str(cur.get(key, "")).upper())
-            rc.pack()
-            rc.bind_select(self._apply_hotkeys)
-            self.hk_vars[key] = rc.var
-            self.hk_combos[key] = rc
+        # 每行最多 3 个，多了换行
+        per_row = 3
+        for row_idx in range(0, len(specs), per_row):
+            hk_row = tk.Frame(b3, bg=ui.CARD)
+            hk_row.pack(fill="x", pady=(0, 4))
+            for key, label in specs[row_idx:row_idx + per_row]:
+                cell = tk.Frame(hk_row, bg=ui.CARD)
+                cell.pack(side="left", padx=(0, 10))
+                tk.Label(cell, text=label, bg=ui.CARD, fg=ui.TEXT2,
+                         font=(ui.FONT, ui.FS_SMALL),
+                         anchor="w").pack(anchor="w")
+                rc = ui.RoundCombo(cell, winapi.HOTKEY_CHOICES,
+                                   width=108, height=28)
+                rc.set(str(cur.get(key, "")).upper())
+                rc.pack()
+                rc.bind_select(self._apply_hotkeys)
+                self.hk_vars[key] = rc.var
+                self.hk_combos[key] = rc
 
         sub = tk.Frame(b3, bg=ui.CARD)
         sub.pack(fill="x", pady=(8, 0))
@@ -1530,10 +1553,12 @@ class App:
                  font=(ui.FONT, ui.FS_SMALL), width=8,
                  anchor="w").pack(side="left")
         self.cb_channel = ui.RoundCombo(
-            ch_row, ["正式版", "轻量版"], width=150, height=28)
+            ch_row, ["正式版", "Beta版", "轻量版"], width=150, height=28)
         self.cb_channel.pack(side="left", padx=(0, 8))
+        _ch = str(self._get("update.channel", "stable") or "stable").lower()
         self.cb_channel.set(
-            "轻量版" if str(self._get("update.channel", "stable")) == "lite"
+            "轻量版" if _ch.startswith("lite")
+            else "Beta版" if _ch.startswith("beta")
             else "正式版")
         self.cb_channel.bind_select(self._on_channel_change)
         self._channel_hint = tk.Label(
@@ -1640,9 +1665,16 @@ class App:
 
     def _on_channel_change(self) -> None:
         """切换更新线路：只影响「检查更新」看哪一串 release。"""
-        ch = "lite" if "轻量" in self.cb_channel.get() else "stable"
+        label = self.cb_channel.get()
+        if "轻量" in label:
+            ch = "lite"
+        elif "beta" in label.lower():
+            ch = "beta"
+        else:
+            ch = "stable"
         self._set("update.channel", ch)
-        self.log(f"[更新] 线路切到{'轻量版' if ch == 'lite' else '正式版'}")
+        name = {"lite": "轻量版", "beta": "Beta版", "stable": "正式版"}.get(ch, ch)
+        self.log(f"[更新] 线路切到{name}")
 
     def _show_sponsor_big(self) -> None:
         """点赞助码弹原尺寸大图（小图在某些屏幕上扫不出来）。"""
@@ -1860,6 +1892,72 @@ class App:
             self._autofill_devices(quiet=True)
         self.log(f"设备：{len(outs)} 个输出 / {len(ins)} 个输入")
 
+    def _device_selfcheck(self) -> None:
+        """设备自检：检测所有音频设备、自动填写、给出诊断建议。
+
+        比让用户自己在几十个设备名里挑靠谱得多 —— 尤其 VB-CABLE 这类
+        虚拟设备，名字长、容易选错（选错的表现是"队友听不到"）。
+        """
+        try:
+            outs = capture.list_outputs()
+            ins = capture.list_inputs()
+        except Exception as e:
+            self.log(f"[设备] 枚举失败：{e}")
+            return
+
+        lines: list[str] = []
+        lines.append(f"检测到 {len(outs)} 个输出设备 / {len(ins)} 个输入设备")
+
+        # ---- 1. 游戏输出（建议物理耳机，不要虚拟线缆）----
+        game = capture.guess_game_output()
+        if game:
+            self._set("audio.game_output_device", game, save=False)
+            self.cb_game.set(game)
+            lines.append(f"✓ 游戏输出 → {game}")
+            low = game.lower()
+            if any(b in low for b in ("cable", "virtual", "voicemeeter")):
+                lines.append("  ⚠ 这是虚拟设备，队友语音可能抓不到。"
+                             "建议选物理耳机/扬声器")
+        else:
+            lines.append("✗ 没找到可用的输出设备")
+
+        # ---- 2. 我的麦克风 ----
+        mic = ins[0]["name"] if ins else ""
+        if mic:
+            self._set("audio.mic_device", mic, save=False)
+            self.cb_mic.set(mic)
+            lines.append(f"✓ 麦克风 → {mic}")
+        else:
+            lines.append("✗ 没找到麦克风")
+
+        # ---- 3. TTS 输出（VB-Cable 虚拟麦克风）----
+        tts = capture.guess_tts_output()
+        if tts:
+            self._set("audio.tts_output_device", tts, save=False)
+            self.cb_tts.set(tts)
+            lines.append(f"✓ TTS 输出 → {tts}")
+        else:
+            lines.append("✗ 没找到 VB-CABLE。装一个虚拟声卡才能把英文"
+                         "送进游戏麦克风（https://vb-audio.com/Cable/）")
+
+        # ---- 4. 虚拟声卡检查 ----
+        has_cable = any("cable" in (o.get("name") or "").lower() for o in outs)
+        if has_cable:
+            lines.append("✓ 已安装 VB-CABLE")
+        else:
+            lines.append("⚠ 未检测到 VB-CABLE：只能听译，队友听不到你的英文")
+
+        self.cfg.save()
+        for ln in lines:
+            self.log(f"[设备] {ln}")
+        try:
+            ok = sum(1 for ln in lines if ln.startswith("✓"))
+            self._dev_hint.configure(
+                text=f"已填好 {ok} 项，详见日志" if ok else "有问题，见日志",
+                fg=ui.GREEN if ok >= 3 else ui.TEXT3)
+        except Exception:
+            pass
+
     def _autofill_devices(self, quiet: bool = False) -> None:
         if not self._get("audio.game_output_device"):
             name = capture.guess_game_output()
@@ -1898,15 +1996,45 @@ class App:
             txt, color = f"☁ {who} + {trans}", ui.BLUE
             tip = "音频会上传到该服务"
         else:
-            # 没配 / 没启用 / 云端不可用 —— 都是走本地
-            txt, color = f"本地识别 + {trans}", ui.TEXT3
-            tip = ""
+            # 没配 / 没启用 / 云端不可用 —— 都是走本地。
+            # 本地 whisper 在 CPU 上实时率约 0.24，打游戏会抢 CPU，
+            # 这里必须让用户看见代价（竞品把「云端、本机占用低」
+            # 当核心卖点，说明这是普遍痛点）。
+            txt, color = f"本地识别（吃 CPU）+ {trans}", "#B45309"
+            tip = ("本地识别会占用 CPU，打游戏掉帧；"
+                   "配了云端密钥可显著降低占用")
         try:
             self.asr_mode_lbl.configure(text=txt, fg=color)
         except Exception:
             pass
         if tip:
             self.log(f"[识别] {txt}（{tip}）")
+
+    def _maybe_prompt_cloud_asr(self) -> None:
+        """首次启动且没配云端识别时，提示一次（只提示一次）。"""
+        if bool(self._get("asr.cloud_prompted", False)):
+            return
+        try:
+            lang = str(self._get("asr.lang_teammates", "en") or "en")
+            if self._use_cloud_asr(lang):
+                self._set("asr.cloud_prompted", True)
+                return
+        except Exception:
+            pass
+        self._set("asr.cloud_prompted", True)
+        try:
+            from .update_ui import NoticeDialog
+            NoticeDialog(
+                self.root, "要打游戏，建议用云端识别",
+                "现在走本机识别：能离线用、音频不外传，"
+                "但会占 CPU（打游戏容易掉帧）。\n\n"
+                "配一个云端识别的密钥（阿里云百炼 / 硅基流动都行），"
+                "识别和翻译都在云端完成，本机几乎不占 CPU。\n\n"
+                "在「配置」页 → 翻译 → 填 base_url / 模型 / 密钥，"
+                "识别那栏留空就会自动跟随。",
+                kind="info")
+        except Exception:
+            self.log("[提示] 用本地识别会占 CPU，配云端密钥可显著降低占用")
 
     def _on_server_change(self) -> None:
         label = self.cb_server.get()
@@ -2036,18 +2164,44 @@ class App:
 
     # ============================================================ 热键
     def _apply_hotkeys(self) -> None:
-        """界面改了快捷键后立即重建绑定，不用重启。"""
+        """界面改了快捷键后立即重建绑定，不用重启。
+
+        ⚠️ 检测到重复/非法时必须回滚下拉框到旧值 —— 只 log 不改 UI
+        的话，下拉框还显示着重复的键，用户以为改成功了。
+        """
         hk = {k: (v.get() or "").strip().lower() for k, v in self.hk_vars.items()}
+        old = {k: str(self._get("hotkeys." + k, "") or "").strip().lower()
+               for k in self.hk_vars}
+
+        def _rollback(changed_key: str):
+            """把改错的下拉框拉回旧值。"""
+            if changed_key in self.hk_combos:
+                try:
+                    self.hk_combos[changed_key].set(
+                        (old.get(changed_key) or "").upper())
+                except Exception:
+                    pass
+
+        # 找出哪个键被改了（用于回滚）
+        changed = [k for k in hk if hk.get(k) != old.get(k)]
+
         if not all(hk.values()):
             self.log("[快捷键] 有键位为空，已忽略本次修改")
+            for k in changed:
+                _rollback(k)
             return
         vals = list(hk.values())
         dup = sorted({v for v in vals if vals.count(v) > 1})
         if dup:
-            self.log(f"[快捷键] {', '.join(k.upper() for k in dup)} 被重复绑定，已忽略")
+            for k in changed:
+                _rollback(k)
+            self.log(f"[快捷键] {', '.join(v.upper() for v in dup)} "
+                     f"已被其他功能占用，已还原")
             return
         if "v" in vals:
-            self.log("[快捷键] V 是游戏开麦键，占用会冲突，已忽略")
+            for k in changed:
+                _rollback(k)
+            self.log("[快捷键] V 是游戏开麦键，占用会冲突，已还原")
             return
         for k, v in hk.items():
             self._set("hotkeys." + k, v, save=False)
@@ -2062,10 +2216,16 @@ class App:
         hk = self._get("hotkeys", {}) or {}
         self.hotkeys.bind("ptt", hk.get("ptt", "f2"),
                           on_press=self._ptt_down, on_release=self._ptt_up)
+        self.hotkeys.bind("ptt_clip", hk.get("ptt_clip", "f7"),
+                          on_press=self._ptt_clip_down,
+                          on_release=self._ptt_clip_up)
         self.hotkeys.bind("through", hk.get("toggle_click_through", "f3"),
                           on_press=self._toggle_through_hotkey)
         self.hotkeys.bind("clear", hk.get("clear_overlay", "f4"),
                           on_press=lambda: self.overlay.clear())
+        self.hotkeys.bind("review", hk.get("review_subtitles", "f6"),
+                          on_press=lambda: self._ui_call(
+                              self, "_review_subtitles"))
         self.hotkeys.bind("mute", hk.get("toggle_mute_outgoing", "f5"),
                           on_press=self._toggle_mute_outgoing)
         self.hotkeys.start()
@@ -2079,12 +2239,31 @@ class App:
             except Exception:
                 pass
         self._me_armed = True
+        self._me_clip_only = False       # False=发语音, True=只复制剪贴板
         self._ui_state("● 正在听你说…", "#fbbf24")
 
     def _ptt_up(self) -> None:
         self._me_armed = False
         seg = self._seg_me.flush() if self._seg_me else None
         if seg is not None and self.flags["me"] and not self._muted_outgoing:
+            self._submit_asr("me", seg)
+        self._ui_state("● 运行中", "#34d399")
+
+    def _ptt_clip_down(self) -> None:
+        """说中文 → 复制译文到剪贴板（不发语音）。按住说，松开翻译+复制。"""
+        if self._seg_me is not None:
+            try:
+                self._seg_me.reset()
+            except Exception:
+                pass
+        self._me_armed = True
+        self._me_clip_only = True
+        self._ui_state("● 正在听你说…（复制模式）", "#60a5fa")
+
+    def _ptt_clip_up(self) -> None:
+        self._me_armed = False
+        seg = self._seg_me.flush() if self._seg_me else None
+        if seg is not None and self.flags["me"]:
             self._submit_asr("me", seg)
         self._ui_state("● 运行中", "#34d399")
 
@@ -2481,6 +2660,13 @@ class App:
             self._refresh_asr_mode_label()
 
     # ============================================================ 手机遥控
+    def _on_clip_toggle(self) -> None:
+        """切换剪贴板模式：翻译完自动复制，按 Ctrl+V 发聊天。"""
+        val = bool(self.v_clip.get())
+        self._set("translate.copy_to_clipboard", val)
+        self.log("剪贴板模式：" + ("开（翻译完自动复制，Ctrl+V 发聊天）"
+                                 if val else "关"))
+
     def _on_remote_toggle(self) -> None:
         """功能开关区的「手机遥控当说话键」被切换。"""
         on = bool(self.v_remote.get())
@@ -2603,6 +2789,61 @@ class App:
             label("启动失败", ui.RED)
             self.log(f"[手机] 遥控启动失败：{self.remote.error}")
             self.log("       Windows 防火墙可能挡住了，点「二维码」→「放行防火墙」")
+
+    def _put_clipboard(self, text: str) -> None:
+        """把译文放进剪贴板（必须在 UI 线程调）。"""
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.log(f"[剪贴板] 已复制，按 Ctrl+V 发到聊天框：{text}")
+        except Exception as e:
+            self.log(f"[剪贴板] 复制失败：{e}")
+
+    def _review_subtitles(self) -> None:
+        """热键回看最近几条字幕（队友刚说的没看清时用）。"""
+        items = self.overlay.recent(5)
+        if not items:
+            self.log("[回看] 还没有字幕")
+            return
+        top = tk.Toplevel(self.root)
+        top.title("最近字幕")
+        top.configure(bg=ui.BG)
+        top.resizable(False, False)
+        try:
+            top.attributes("-topmost", True)
+        except Exception:
+            pass
+        box = tk.Frame(top, bg=ui.BG)
+        box.pack(padx=18, pady=14, fill="both", expand=True)
+        tag_color = {"队友": ui.BLUE, "我": ui.GREEN, "聊天": ui.TEXT2}
+        for it in items:
+            row = tk.Frame(box, bg=ui.BG)
+            row.pack(fill="x", pady=3)
+            tk.Label(row, text=f"[{it.tag}]", bg=ui.BG,
+                     fg=tag_color.get(it.tag, ui.TEXT3),
+                     font=(ui.FONT, 9, "bold")).pack(side="left", padx=(0, 6))
+            tk.Label(row, text=it.text, bg=ui.BG, fg=ui.TEXT,
+                     font=(ui.FONT, ui.FS_SMALL), wraplength=420,
+                     justify="left").pack(side="left")
+            if it.original:
+                tk.Label(row, text=f"  ({it.original})", bg=ui.BG,
+                         fg=ui.TEXT3, font=(ui.FONT, 8),
+                         wraplength=420, justify="left").pack(side="left")
+        tk.Label(box, text="Esc 或点任意处关闭", bg=ui.BG, fg=ui.TEXT3,
+                 font=(ui.FONT, 8)).pack(pady=(10, 0))
+        top.bind("<Escape>", lambda _e: top.destroy())
+        for child in box.winfo_children():
+            child.bind("<Button-1>", lambda _e: top.destroy())
+        top.update_idletasks()
+        try:
+            x = self.root.winfo_rootx() + (self.root.winfo_width()
+                                           - top.winfo_width()) // 2
+            y = self.root.winfo_rooty() + (self.root.winfo_height()
+                                           - top.winfo_height()) // 3
+            top.geometry(f"+{max(0, x)}+{max(0, y)}")
+            top.focus_force()
+        except Exception:
+            pass
 
     def _copy_remote(self) -> None:
         url = self.remote.url
@@ -3054,11 +3295,25 @@ class App:
         if job.kind == "teammates":
             if not self.flags["team"]:
                 return
+            # ★ 按进程过滤：游戏没在播音频时跳过（排除 Discord/音乐）
+            if not self.audio_filter.is_game_active():
+                return
+            # ★ 特工台词过滤：短句 + 无报点特征 = 游戏内置语音
+            if is_agent_voice(job.text):
+                return
             src = job.detected_lang or self._get("asr.lang_teammates", "en") or "en"
             tag = ""
             if job.asr_backend == "cloud":
                 tag = "〔云〕"
             zh = self.translator.translate(job.text, src, "zh-CN")
+            # ★ LLM 判定这是游戏配音（特工台词/系统播报）→ 翻译层返回 [SKIP]
+            #   规则表只能枚举高频条目，上千条特工语音靠它兜底。
+            #   误杀队友的话可以在配置里关掉 ocr.skip_game_audio。
+            if zh and bool(self._get("ocr.skip_game_audio", True)):
+                tok = zh.strip().upper().strip("[]【】（）() ")
+                if tok in ("SKIP", "跳过"):
+                    self.log(f"[跳过] 疑似游戏配音：{job.text}")
+                    return
             shown = zh or "（翻译失败）" + job.text
             self.log(f"队友：{job.text} → {zh} {tag}".rstrip())
             self._overlay("队友", shown, job.text if zh else "")
@@ -3072,8 +3327,19 @@ class App:
             if not out:
                 self.log(f"[翻译失败] {job.text}")
                 return
+            # ★ 剪贴板模式：只复制到剪贴板，不发语音（不调 TTS）
+            if getattr(self, "_me_clip_only", False):
+                self._me_clip_only = False
+                self._ui_call(self, "_put_clipboard", out)
+                self.log(f"我：{job.text} → {out}（已复制，Ctrl+V 发聊天）")
+                return
             self.log(f"我：{job.text} → {out}")
             self._overlay("我", out, job.text)
+            # ★ 自动复制到剪贴板：用户按 Ctrl+V 就能发到游戏聊天框。
+            #   比模拟按键可靠 —— Ctrl+V 不受 UIPI 完整性级别限制，
+            #   不需要管理员权限（模拟 V 键则需要）。
+            if bool(self._get("translate.copy_to_clipboard", True)):
+                self._ui_call(self, "_put_clipboard", out)
             self.tts.speak(out)
         elif job.kind == "chat":
             if not self.flags["chat"] or not job.text:

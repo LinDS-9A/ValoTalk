@@ -174,6 +174,13 @@ class Overlay:
         winapi.keep_topmost(self._hwnd)
         self._last_top = time.time()
 
+    def recent(self, n: int = 5) -> list:
+        """最近 n 条字幕（给热键回看用）。"""
+        try:
+            return list(self.items)[-max(1, n):]
+        except Exception:
+            return []
+
     def clear(self) -> None:
         self.root.after(0, self._clear_main)
 
